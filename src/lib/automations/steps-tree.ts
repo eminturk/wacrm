@@ -154,7 +154,7 @@ export async function loadStepsTree(automationId: string): Promise<BuilderStepNo
       })
       .from(automationSteps)
       .where(eq(automationSteps.automationId, automationId))
-      .orderBy(asc(automationSteps.position))) as DbStep[]
+      .orderBy(asc(automationSteps.position))) as unknown as DbStep[]
   } catch (err) {
     throw new Error(err instanceof Error ? err.message : String(err))
   }

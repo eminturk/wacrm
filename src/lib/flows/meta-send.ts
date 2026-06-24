@@ -19,8 +19,10 @@ import { db } from './admin-client'
 import { contacts, conversations, messages, whatsappConfig } from '@/lib/db/schema'
 
 // ------------------------------------------------------------
+// Drizzle helpers shared by the text/media/interactive senders.
+// ------------------------------------------------------------
 
-type EngineContact = { id: string; phone: string | null }
+type EngineContact = { id: string; phone: string }
 type EngineWhatsappConfig = { phone_number_id: string; access_token: string }
 
 async function loadContact(accountId: string, contactId: string): Promise<EngineContact> {
@@ -113,6 +115,8 @@ async function updateConversationPreview(args: {
     // Previous PostgREST calls ignored conversation preview update errors.
   }
 }
+
+// ------------------------------------------------------------
 // Flows-side Meta sender (interactive variants).
 //
 // Mirrors src/lib/automations/meta-send.ts (engineSendText /
