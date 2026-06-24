@@ -1,5 +1,7 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import { NextResponse } from 'next/server'
-import { createClient } from '@/lib/supabase/server'
+import { db, sql } from '@/lib/db'
+import { getSession } from '@/lib/auth/session'
 import { sendTemplateMessage } from '@/lib/whatsapp/meta-api'
 import { decrypt } from '@/lib/whatsapp/encryption'
 import type { SendTimeParams } from '@/lib/whatsapp/template-send-builder'
@@ -15,6 +17,8 @@ import {
   rateLimitResponse,
   RATE_LIMITS,
 } from '@/lib/rate-limit'
+
+type DbRow = Record<string, any>
 
 interface BroadcastResult {
   phone: string
@@ -58,16 +62,21 @@ interface NewRecipient {
   messageParams?: SendTimeParams
 }
 
+async function resolveAccountId(userId: string): Promise<string | null> {
+  const rows = (await db.execute(sql`
+    SELECT account_id
+    FROM profiles
+    WHERE user_id = ${userId}
+    LIMIT 1
+  `)) as DbRow[]
+  return rows[0]?.account_id ?? null
+}
+
 export async function POST(request: Request) {
   try {
-    const supabase = await createClient()
+    const user = await getSession()
 
-    const {
-      data: { user },
-      error: authError,
-    } = await supabase.auth.getUser()
-
-    if (authError || !user) {
+    if (!user) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
@@ -83,12 +92,7 @@ export async function POST(request: Request) {
     // + broadcasts are all account-scoped post-multi-user, so the
     // old `.eq('user_id', user.id)` filters miss every row created
     // by a teammate.
-    const { data: profile } = await supabase
-      .from('profiles')
-      .select('account_id')
-      .eq('user_id', user.id)
-      .maybeSingle()
-    const accountId = profile?.account_id as string | undefined
+    const accountId = await resolveAccountId(user.id)
     if (!accountId) {
       return NextResponse.json(
         { error: 'Your profile is not linked to an account.' },
@@ -134,13 +138,15 @@ export async function POST(request: Request) {
       )
     }
 
-    const { data: config, error: configError } = await supabase
-      .from('whatsapp_config')
-      .select('*')
-      .eq('account_id', accountId)
-      .single()
+    const configRows = (await db.execute(sql`
+      SELECT *
+      FROM whatsapp_config
+      WHERE account_id = ${accountId}
+      LIMIT 1
+    `)) as DbRow[]
+    const config = configRows[0]
 
-    if (configError || !config) {
+    if (!config) {
       return NextResponse.json(
         {
           error:
@@ -154,16 +160,18 @@ export async function POST(request: Request) {
 
     // Load the template row once so sendTemplateMessage can build
     // header + button components on each iteration. Loading inside
-    // the loop would N+1 against Supabase for every recipient.
+    // the loop would N+1 against the database for every recipient.
     // Guard against a malformed local row crashing every send in
     // the loop with the same opaque TypeError — fail loudly once.
-    const { data: rawTemplateRow } = await supabase
-      .from('message_templates')
-      .select('*')
-      .eq('account_id', accountId)
-      .eq('name', template_name)
-      .eq('language', template_language || 'en_US')
-      .maybeSingle()
+    const templateRows = (await db.execute(sql`
+      SELECT *
+      FROM message_templates
+      WHERE account_id = ${accountId}
+        AND name = ${template_name}
+        AND language = ${template_language || 'en_US'}
+      LIMIT 1
+    `)) as DbRow[]
+    const rawTemplateRow = templateRows[0]
     if (rawTemplateRow && !isMessageTemplate(rawTemplateRow)) {
       return NextResponse.json(
         {

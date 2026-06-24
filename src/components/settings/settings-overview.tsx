@@ -3,7 +3,6 @@
 import { useEffect, useState, type ReactNode } from 'react';
 import { ChevronRight, Loader2 } from 'lucide-react';
 
-import { createClient } from '@/lib/supabase/client';
 import { useAuth } from '@/hooks/use-auth';
 import { useTheme } from '@/hooks/use-theme';
 import { THEMES } from '@/lib/themes';
@@ -51,14 +50,11 @@ export function SettingsOverview({
   useEffect(() => {
     if (!user || !accountId) return;
     let cancelled = false;
-    const supabase = createClient();
-    const userId = user.id;
-    const acctId = accountId;
 
     // Cheap counts — resolve fast, render immediately.
     (async () => {
       setCountsLoading(true);
-      const [membersRes, invitesRes, templatesTotal, templatesPending, tagsRes, fieldsRes] =
+      const [membersRes, invitesRes, templatesTotal] =
         await Promise.allSettled([
           fetch('/api/account/members', { cache: 'no-store' }).then((r) => r.json()),
           canManageMembers
@@ -66,20 +62,9 @@ export function SettingsOverview({
                 r.json(),
               )
             : Promise.resolve(null),
-          supabase
-            .from('message_templates')
-            .select('id', { count: 'exact', head: true })
-            .eq('user_id', userId),
-          supabase
-            .from('message_templates')
-            .select('id', { count: 'exact', head: true })
-            .eq('user_id', userId)
-            .eq('status', 'PENDING'),
-          supabase
-            .from('tags')
-            .select('id', { count: 'exact', head: true })
-            .eq('user_id', userId),
-          supabase.from('custom_fields').select('id', { count: 'exact', head: true }),
+          fetch('/api/settings/profile', { method: 'POST', cache: 'no-store' }).then((r) =>
+            r.json(),
+          ),
         ]);
 
       if (cancelled) return;
@@ -100,15 +85,20 @@ export function SettingsOverview({
         pendingInvites,
         templates:
           templatesTotal.status === 'fulfilled'
-            ? templatesTotal.value.count ?? null
+            ? templatesTotal.value?.counts?.templates ?? null
             : null,
         templatesPending:
-          templatesPending.status === 'fulfilled'
-            ? templatesPending.value.count ?? null
+          templatesTotal.status === 'fulfilled'
+            ? templatesTotal.value?.counts?.templatesPending ?? null
             : null,
-        tags: tagsRes.status === 'fulfilled' ? tagsRes.value.count ?? null : null,
+        tags:
+          templatesTotal.status === 'fulfilled'
+            ? templatesTotal.value?.counts?.tags ?? null
+            : null,
         customFields:
-          fieldsRes.status === 'fulfilled' ? fieldsRes.value.count ?? null : null,
+          templatesTotal.status === 'fulfilled'
+            ? templatesTotal.value?.counts?.customFields ?? null
+            : null,
       });
       setCountsLoading(false);
     })();
@@ -116,17 +106,12 @@ export function SettingsOverview({
     // WhatsApp connection status — slower, independent.
     (async () => {
       setWhatsappLoading(true);
-      const [row, health] = await Promise.allSettled([
-        supabase
-          .from('whatsapp_config')
-          .select('phone_number_id')
-          .eq('account_id', acctId)
-          .maybeSingle(),
+      const [health] = await Promise.allSettled([
         fetch('/api/whatsapp/config', { cache: 'no-store' }).then((r) => r.json()),
       ]);
       if (cancelled) return;
       setWhatsapp({
-        configured: row.status === 'fulfilled' && !!row.value.data?.phone_number_id,
+        configured: health.status === 'fulfilled' && !!health.value?.config?.phone_number_id,
         connected: health.status === 'fulfilled' && !!health.value?.connected,
       });
       setWhatsappLoading(false);

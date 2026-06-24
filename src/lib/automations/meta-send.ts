@@ -6,7 +6,9 @@ import {
   phoneVariants,
   isRecipientNotAllowedError,
 } from '@/lib/whatsapp/phone-utils'
-import { supabaseAdmin } from './admin-client'
+import { and, eq } from 'drizzle-orm'
+import { db } from './admin-client'
+import { contacts, conversations, messages, whatsappConfig } from '@/lib/db/schema'
 
 // ------------------------------------------------------------
 // Automation-side Meta sender.
@@ -58,8 +60,6 @@ type SendInput =
   | (SendTemplateArgs & { kind: 'template' })
 
 async function sendViaMeta(input: SendInput): Promise<{ whatsapp_message_id: string }> {
-  const db = supabaseAdmin()
-
   // Scope the contact + config lookups by account_id, not user_id.
   // The engine uses the service-role client (bypassing RLS); without
   // this filter, an authenticated user could fire their own
@@ -68,13 +68,18 @@ async function sendViaMeta(input: SendInput): Promise<{ whatsapp_message_id: str
   // migration moved both tables to account-scoped tenancy, so the
   // check is the same defense-in-depth as before, just keyed on the
   // new tenancy column.
-  const { data: contact, error: contactErr } = await db
-    .from('contacts')
-    .select('id, phone')
-    .eq('id', input.contactId)
-    .eq('account_id', input.accountId)
-    .maybeSingle()
-  if (contactErr || !contact?.phone) {
+  let contact: { id: string; phone: string | null } | undefined
+  try {
+    ;[contact] = await db
+      .select({ id: contacts.id, phone: contacts.phone })
+      .from(contacts)
+      .where(and(eq(contacts.id, input.contactId), eq(contacts.accountId, input.accountId)))
+      .limit(1)
+  } catch {
+    // Preserve the previous PostgREST behavior: any lookup error is
+    // indistinguishable from a missing tenant-scoped contact to callers.
+  }
+  if (!contact?.phone) {
     throw new Error('contact not found for this account')
   }
 
@@ -83,12 +88,25 @@ async function sendViaMeta(input: SendInput): Promise<{ whatsapp_message_id: str
     throw new Error(`contact phone invalid: ${contact.phone}`)
   }
 
-  const { data: config, error: configErr } = await db
-    .from('whatsapp_config')
-    .select('*')
-    .eq('account_id', input.accountId)
-    .single()
-  if (configErr || !config) {
+  let config:
+    | {
+        phone_number_id: string
+        access_token: string
+      }
+    | undefined
+  try {
+    ;[config] = await db
+      .select({
+        phone_number_id: whatsappConfig.phoneNumberId,
+        access_token: whatsappConfig.accessToken,
+      })
+      .from(whatsappConfig)
+      .where(eq(whatsappConfig.accountId, input.accountId))
+      .limit(1)
+  } catch {
+    // Match prior `.single()` handling: callers get the configured error.
+  }
+  if (!config) {
     throw new Error('WhatsApp not configured for this account')
   }
 
@@ -137,7 +155,14 @@ async function sendViaMeta(input: SendInput): Promise<{ whatsapp_message_id: str
   if (lastError) throw lastError
 
   if (workingPhone !== sanitized) {
-    await db.from('contacts').update({ phone: workingPhone }).eq('id', contact.id)
+    try {
+      await db
+        .update(contacts)
+        .set({ phone: workingPhone, updatedAt: new Date() })
+        .where(and(eq(contacts.id, contact.id), eq(contacts.accountId, input.accountId)))
+    } catch {
+      // Previous PostgREST call ignored this best-effort normalization error.
+    }
   }
 
   // Persist the sent message so it appears in the inbox with a real
@@ -147,30 +172,35 @@ async function sendViaMeta(input: SendInput): Promise<{ whatsapp_message_id: str
   const content_text = input.kind === 'text' ? input.text : null
   const template_name = input.kind === 'template' ? input.templateName : null
 
-  const { error: msgErr } = await db.from('messages').insert({
-    conversation_id: input.conversationId,
-    sender_type: 'bot',
-    content_type,
-    content_text,
-    template_name,
-    message_id: waMessageId,
-    status: 'sent',
-  })
-  if (msgErr) {
+  try {
+    await db.insert(messages).values({
+      conversationId: input.conversationId,
+      senderType: 'bot',
+      contentType: content_type,
+      contentText: content_text,
+      templateName: template_name,
+      messageId: waMessageId,
+      status: 'sent',
+    })
+  } catch (err) {
     // Meta already has the message; record the DB error but don't pretend
     // the send failed. The engine wraps this in a log line.
-    throw new Error(`sent to Meta but DB insert failed: ${msgErr.message}`)
+    throw new Error(`sent to Meta but DB insert failed: ${err instanceof Error ? err.message : String(err)}`)
   }
 
-  await db
-    .from('conversations')
-    .update({
-      last_message_text:
-        input.kind === 'template' ? `[template:${input.templateName}]` : input.text,
-      last_message_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    })
-    .eq('id', input.conversationId)
+  try {
+    await db
+      .update(conversations)
+      .set({
+        lastMessageText:
+          input.kind === 'template' ? `[template:${input.templateName}]` : input.text,
+        lastMessageAt: new Date(),
+        updatedAt: new Date(),
+      })
+      .where(and(eq(conversations.id, input.conversationId), eq(conversations.accountId, input.accountId)))
+  } catch {
+    // Previous PostgREST call ignored conversation preview update errors.
+  }
 
   return { whatsapp_message_id: waMessageId }
 }

@@ -1,8 +1,6 @@
 'use client';
 
 import { useCallback, useEffect, useState } from 'react';
-import { createClient } from '@/lib/supabase/client';
-import { useAuth } from '@/hooks/use-auth';
 import { toast } from 'sonner';
 import type { CustomField } from '@/types';
 import {
@@ -35,7 +33,9 @@ export function CustomFieldsManager({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="border-border bg-popover text-popover-foreground sm:max-w-md">
         <DialogHeader>
-          <DialogTitle className="text-popover-foreground">Custom fields</DialogTitle>
+          <DialogTitle className="text-popover-foreground">
+            Custom fields
+          </DialogTitle>
           <DialogDescription className="text-muted-foreground">
             Define extra contact fields (e.g. ZIP code, lead source). They
             appear on every contact and in the “Update Contact Field” automation
@@ -55,9 +55,6 @@ export function CustomFieldsManager({
  * `custom_fields` RLS also rejects non-admin writes as defense in depth.
  */
 export function CustomFieldsPanel() {
-  const supabase = createClient();
-  const { user, accountId } = useAuth();
-
   const [fields, setFields] = useState<CustomField[]>([]);
   const [loading, setLoading] = useState(true);
   const [newName, setNewName] = useState('');
@@ -65,25 +62,24 @@ export function CustomFieldsPanel() {
   const [busyId, setBusyId] = useState<string | null>(null);
 
   const fetchFields = useCallback(async () => {
-    if (!accountId) return;
     setLoading(true);
-    const { data } = await supabase
-      .from('custom_fields')
-      .select('*')
-      .order('field_name');
-    setFields((data as CustomField[] | null) ?? []);
-    setLoading(false);
-  }, [supabase, accountId]);
-
-  // Load the field list on mount once the account is known. The setters
-  // inside fetchFields run after the Supabase await — not synchronously in
-  // the effect body — so the cascade the lint rule warns about doesn't apply.
-  useEffect(() => {
-    if (accountId) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
-      fetchFields();
+    const res = await fetch('/api/custom-fields', { cache: 'no-store' });
+    if (res.ok) {
+      const { fields } = (await res.json()) as { fields?: CustomField[] };
+      setFields(fields ?? []);
+    } else {
+      setFields([]);
     }
-  }, [accountId, fetchFields]);
+    setLoading(false);
+  }, []);
+
+  // Load the field list on mount. The setters inside fetchFields run after
+  // the fetch await — not synchronously in the effect body — so the cascade
+  // the lint rule warns about doesn't apply.
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    fetchFields();
+  }, [fetchFields]);
 
   /** Case-insensitive name clash within the loaded list. */
   function isDuplicate(name: string, exceptId?: string): boolean {
@@ -96,25 +92,20 @@ export function CustomFieldsPanel() {
   async function handleCreate() {
     const name = newName.trim();
     if (!name) return;
-    if (!accountId || !user) {
-      toast.error('Your profile is not linked to an account.');
-      return;
-    }
     if (isDuplicate(name)) {
       toast.error(`A field named "${name}" already exists.`);
       return;
     }
 
     setCreating(true);
-    const { error } = await supabase.from('custom_fields').insert({
-      field_name: name,
-      field_type: 'text',
-      user_id: user.id,
-      account_id: accountId,
+    const res = await fetch('/api/custom-fields', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ field_name: name, field_type: 'text' }),
     });
     setCreating(false);
 
-    if (error) {
+    if (!res.ok) {
       toast.error('Could not create field. You may not have permission.');
       return;
     }
@@ -136,12 +127,13 @@ export function CustomFieldsPanel() {
       return false;
     }
     setBusyId(field.id);
-    const { error } = await supabase
-      .from('custom_fields')
-      .update({ field_name: name })
-      .eq('id', field.id);
+    const res = await fetch(`/api/custom-fields/${field.id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ field_name: name }),
+    });
     setBusyId(null);
-    if (error) {
+    if (!res.ok) {
       toast.error('Could not rename field.');
       return false;
     }
@@ -158,12 +150,11 @@ export function CustomFieldsPanel() {
       return;
     }
     setBusyId(field.id);
-    const { error } = await supabase
-      .from('custom_fields')
-      .delete()
-      .eq('id', field.id);
+    const res = await fetch(`/api/custom-fields/${field.id}`, {
+      method: 'DELETE',
+    });
     setBusyId(null);
-    if (error) {
+    if (!res.ok) {
       toast.error('Could not delete field.');
       return;
     }
@@ -202,18 +193,18 @@ export function CustomFieldsPanel() {
       </div>
 
       {/* List */}
-      <div className="max-h-72 overflow-y-auto rounded-md border border-border">
+      <div className="border-border max-h-72 overflow-y-auto rounded-md border">
         {loading ? (
-          <div className="flex items-center justify-center gap-2 py-8 text-sm text-muted-foreground">
+          <div className="text-muted-foreground flex items-center justify-center gap-2 py-8 text-sm">
             <Loader2 className="size-4 animate-spin" />
             Loading…
           </div>
         ) : fields.length === 0 ? (
-          <p className="py-8 text-center text-sm text-muted-foreground">
+          <p className="text-muted-foreground py-8 text-center text-sm">
             No custom fields yet.
           </p>
         ) : (
-          <ul className="divide-y divide-border">
+          <ul className="divide-border divide-y">
             {fields.map((field) => (
               <FieldRow
                 key={field.id}
@@ -265,7 +256,7 @@ function FieldRow({
           if (e.key === 'Enter') e.currentTarget.blur();
         }}
         aria-label={`Rename ${field.field_name}`}
-        className="focus:border-primary h-8 border-transparent bg-transparent text-foreground hover:border-border"
+        className="focus:border-primary text-foreground hover:border-border h-8 border-transparent bg-transparent"
       />
       <Button
         variant="ghost"
@@ -273,7 +264,7 @@ function FieldRow({
         disabled={busy}
         onClick={() => onDelete(field)}
         title="Delete field"
-        className="shrink-0 text-muted-foreground hover:text-red-400"
+        className="text-muted-foreground shrink-0 hover:text-red-400"
       >
         {busy ? (
           <Loader2 className="size-4 animate-spin" />

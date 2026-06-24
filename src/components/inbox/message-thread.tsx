@@ -1,7 +1,6 @@
 "use client";
 
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
-import { createClient } from "@/lib/supabase/client";
 import { useAuth } from "@/hooks/use-auth";
 import { usePresence } from "@/hooks/use-presence";
 import { PresenceDot } from "@/components/presence/presence-dot";
@@ -196,24 +195,35 @@ export function MessageThread({
   }, [isRefreshing, onRefresh]);
   const [replyTo, setReplyTo] = useState<ReplyDraft | null>(null);
 
-  // Profiles are bounded by RLS to rows the current user is allowed to
-  // see — today that's just the current user, but the dropdown keeps the
-  // shape ready for shared-team workspaces without a refactor.
   useEffect(() => {
     let cancelled = false;
-    const supabase = createClient();
-    supabase
-      .from("profiles")
-      .select("*")
-      .order("full_name")
-      .then(({ data, error }) => {
-        if (cancelled) return;
-        if (error) {
-          console.error("Failed to fetch profiles:", error);
-          return;
-        }
-        setProfiles((data as Profile[]) ?? []);
-      });
+    (async () => {
+      const res = await fetch("/api/account/members");
+      const payload = await res.json().catch(() => ({}));
+      if (cancelled) return;
+      if (!res.ok) {
+        console.error("Failed to fetch profiles:", payload?.error || `HTTP ${res.status}`);
+        return;
+      }
+      const mapped = ((payload.members ?? []) as Array<{
+        user_id: string;
+        full_name: string;
+        email: string | null;
+        avatar_url: string | null;
+        role: string;
+        joined_at: string;
+      }>).map((m) => ({
+        id: m.user_id,
+        user_id: m.user_id,
+        full_name: m.full_name,
+        email: m.email ?? "",
+        avatar_url: m.avatar_url ?? undefined,
+        role: m.role,
+        account_role: m.role,
+        created_at: m.joined_at,
+      })) as Profile[];
+      setProfiles(mapped);
+    })();
     return () => {
       cancelled = true;
     };
@@ -261,6 +271,29 @@ export function MessageThread({
   const conversationId = conversation?.id;
   const hasUnread = (conversation?.unread_count ?? 0) > 0;
 
+  const fetchThread = useCallback(
+    async (convId: string, showLoading = true, shouldApply: () => boolean = () => true) => {
+      if (showLoading) setLoading(true);
+      try {
+        const res = await fetch(`/api/conversations/${convId}/messages`);
+        const payload = await res.json().catch(() => ({}));
+        if (!shouldApply()) return;
+        if (!res.ok) {
+          console.error("Failed to fetch messages:", payload?.error || `HTTP ${res.status}`);
+          return;
+        }
+        onMessagesLoadedRef.current((payload.messages as Message[] | undefined) ?? []);
+        setReactions((payload.reactions as MessageReaction[] | undefined) ?? []);
+      } catch (err) {
+        if (!shouldApply()) return;
+        console.error("Failed to fetch messages:", err);
+      } finally {
+        if (showLoading && shouldApply()) setLoading(false);
+      }
+    },
+    [],
+  );
+
   // Fetch messages whenever the selected conversation changes. Kept
   // separate from the unread-reset effect so that incoming messages
   // arriving while the thread is open don't trigger a full refetch —
@@ -268,27 +301,11 @@ export function MessageThread({
   useEffect(() => {
     if (!conversationId) return;
 
-    const supabase = createClient();
     let cancelled = false;
 
     (async () => {
-      setLoading(true);
-
-      const { data, error } = await supabase
-        .from("messages")
-        .select("*")
-        .eq("conversation_id", conversationId)
-        .order("created_at", { ascending: true });
-
       if (cancelled) return;
-
-      if (error) {
-        console.error("Failed to fetch messages:", error);
-      } else {
-        onMessagesLoadedRef.current(data ?? []);
-      }
-
-      if (!cancelled) setLoading(false);
+      await fetchThread(conversationId, true, () => !cancelled);
     })();
 
     return () => {
@@ -298,110 +315,7 @@ export function MessageThread({
     // the realtime channel reconnects or the tab regains focus —
     // realtime is best-effort and any message events sent while the WS
     // was disconnected or throttled are otherwise lost.
-  }, [conversationId, resyncToken]);
-
-  // Reactions fetch — pulls the current state from the DB. Kept separate
-  // from the channel subscription below so a `resyncToken` bump just
-  // refetches the rows without also tearing down and rebuilding the
-  // realtime channel.
-  useEffect(() => {
-    if (!conversationId) {
-      setReactions([]);
-      return;
-    }
-    const supabase = createClient();
-    let cancelled = false;
-
-    (async () => {
-      const { data, error } = await supabase
-        .from("message_reactions")
-        .select("*")
-        .eq("conversation_id", conversationId);
-      if (cancelled) return;
-      if (error) {
-        console.error("Failed to fetch reactions:", error);
-        return;
-      }
-      setReactions((data as MessageReaction[]) ?? []);
-    })();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [conversationId, resyncToken]);
-
-  // Reactions realtime subscription per conversation. Subscribing here
-  // (not at the page level) keeps the channel scoped to the visible
-  // conversation and avoids cross-conversation chatter on a busy inbox.
-  useEffect(() => {
-    if (!conversationId) return;
-    const supabase = createClient();
-
-    const channel = supabase
-      .channel(`reactions:${conversationId}`)
-      .on(
-        "postgres_changes",
-        {
-          event: "INSERT",
-          schema: "public",
-          table: "message_reactions",
-          filter: `conversation_id=eq.${conversationId}`,
-        },
-        (payload) => {
-          const row = payload.new as MessageReaction;
-          setReactions((prev) => {
-            if (prev.some((r) => r.id === row.id)) return prev;
-            // Swap any matching optimistic temp row for the real one so
-            // the pill doesn't double up after a successful POST.
-            const tempIdx = prev.findIndex(
-              (r) =>
-                r.id.startsWith("temp-") &&
-                r.message_id === row.message_id &&
-                r.actor_type === row.actor_type &&
-                r.actor_id === row.actor_id,
-            );
-            if (tempIdx >= 0) {
-              const copy = prev.slice();
-              copy[tempIdx] = row;
-              return copy;
-            }
-            return [...prev, row];
-          });
-        },
-      )
-      .on(
-        "postgres_changes",
-        {
-          event: "UPDATE",
-          schema: "public",
-          table: "message_reactions",
-          filter: `conversation_id=eq.${conversationId}`,
-        },
-        (payload) => {
-          const row = payload.new as MessageReaction;
-          setReactions((prev) => prev.map((r) => (r.id === row.id ? row : r)));
-        },
-      )
-      .on(
-        "postgres_changes",
-        {
-          event: "DELETE",
-          schema: "public",
-          table: "message_reactions",
-          filter: `conversation_id=eq.${conversationId}`,
-        },
-        (payload) => {
-          const old = payload.old as Partial<MessageReaction>;
-          if (!old?.id) return;
-          setReactions((prev) => prev.filter((r) => r.id !== old.id));
-        },
-      )
-      .subscribe();
-
-    return () => {
-      supabase.removeChannel(channel);
-    };
-  }, [conversationId]);
+  }, [conversationId, resyncToken, fetchThread]);
 
   // Clear any in-progress reply draft when the active conversation changes —
   // a quote pulled from conversation A shouldn't bleed into conversation B.
@@ -420,13 +334,19 @@ export function MessageThread({
   // is 0 the condition is false, so no further UPDATE is issued.
   useEffect(() => {
     if (!conversationId || !hasUnread) return;
-    const supabase = createClient();
-    supabase
-      .from("conversations")
-      .update({ unread_count: 0 })
-      .eq("id", conversationId)
-      .then(({ error }) => {
-        if (error) console.error("Failed to reset unread_count:", error);
+    fetch(`/api/conversations/${conversationId}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ unread_count: 0 }),
+    })
+      .then(async (res) => {
+        if (!res.ok) {
+          const payload = await res.json().catch(() => ({}));
+          console.error("Failed to reset unread_count:", payload?.error || `HTTP ${res.status}`);
+        }
+      })
+      .catch((err) => {
+        console.error("Failed to reset unread_count:", err);
       });
   }, [conversationId, hasUnread]);
 
@@ -565,11 +485,17 @@ export function MessageThread({
     async (status: ConversationStatus) => {
       if (!conversation) return;
 
-      const supabase = createClient();
-      await supabase
-        .from("conversations")
-        .update({ status })
-        .eq("id", conversation.id);
+      const res = await fetch(`/api/conversations/${conversation.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status }),
+      });
+      if (!res.ok) {
+        const payload = await res.json().catch(() => ({}));
+        console.error("Failed to update status:", payload?.error || `HTTP ${res.status}`);
+        toast.error("Failed to update status");
+        return;
+      }
 
       onStatusChange(conversation.id, status);
     },
@@ -748,27 +674,29 @@ export function MessageThread({
           const payload = await res.json().catch(() => ({}));
           throw new Error(payload?.error || `HTTP ${res.status}`);
         }
+        await fetchThread(convId, false);
       } catch (err) {
         const reason = err instanceof Error ? err.message : "network error";
         toast.error(`Reaction failed: ${reason}`);
         setReactions(snapshot);
       }
     },
-    [conversation, user?.id],
+    [conversation, fetchThread, user?.id],
   );
 
   const handleAssignChange = useCallback(
     async (agentId: string | null) => {
       if (!conversation) return;
 
-      const supabase = createClient();
-      const { error } = await supabase
-        .from("conversations")
-        .update({ assigned_agent_id: agentId })
-        .eq("id", conversation.id);
+      const res = await fetch(`/api/conversations/${conversation.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ assigned_agent_id: agentId }),
+      });
 
-      if (error) {
-        console.error("Failed to update assignment:", error);
+      if (!res.ok) {
+        const payload = await res.json().catch(() => ({}));
+        console.error("Failed to update assignment:", payload?.error || `HTTP ${res.status}`);
         toast.error("Failed to update assignment");
         return;
       }

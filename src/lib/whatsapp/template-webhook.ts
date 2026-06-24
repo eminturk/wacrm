@@ -27,44 +27,48 @@
  * warning so operators can investigate.
  */
 
-import type { SupabaseClient } from '@supabase/supabase-js'
-import { normalizeStatus } from './template-status-normalize'
+import { eq } from 'drizzle-orm';
+import type { db as appDb } from '@/lib/db';
+import { messageTemplates } from '@/lib/db/schema';
+import { normalizeStatus } from './template-status-normalize';
+
+type DrizzleDb = typeof appDb;
 
 const TEMPLATE_WEBHOOK_FIELDS = new Set([
   'message_template_status_update',
   'message_template_quality_update',
   'message_template_components_update',
-])
+]);
 
 export function isTemplateWebhookField(field: string): boolean {
-  return TEMPLATE_WEBHOOK_FIELDS.has(field)
+  return TEMPLATE_WEBHOOK_FIELDS.has(field);
 }
 
 interface TemplateStatusUpdateValue {
-  event?: string
-  message_template_id?: string | number
-  message_template_name?: string
-  message_template_language?: string
-  reason?: string
+  event?: string;
+  message_template_id?: string | number;
+  message_template_name?: string;
+  message_template_language?: string;
+  reason?: string;
 }
 
 interface TemplateQualityUpdateValue {
-  message_template_id?: string | number
-  message_template_name?: string
-  message_template_language?: string
-  previous_quality_score?: string
-  new_quality_score?: string
+  message_template_id?: string | number;
+  message_template_name?: string;
+  message_template_language?: string;
+  previous_quality_score?: string;
+  new_quality_score?: string;
 }
 
 interface TemplateComponentsUpdateValue {
-  message_template_id?: string | number
-  message_template_name?: string
-  message_template_language?: string
+  message_template_id?: string | number;
+  message_template_name?: string;
+  message_template_language?: string;
 }
 
 export interface TemplateWebhookChange {
-  field: string
-  value: unknown
+  field: string;
+  value: unknown;
 }
 
 /**
@@ -75,123 +79,113 @@ export interface TemplateWebhookChange {
  */
 export async function handleTemplateWebhookChange(
   change: TemplateWebhookChange,
-  // SupabaseClient typed loosely — the webhook route lazy-initialises
-  // the admin client and exposes it as `any`. Type as the generic
-  // SupabaseClient here so this module is testable in isolation.
-  supabase: SupabaseClient,
+  db: DrizzleDb
 ): Promise<void> {
   switch (change.field) {
     case 'message_template_status_update':
-      await handleStatusUpdate(
-        change.value as TemplateStatusUpdateValue,
-        supabase,
-      )
-      return
+      await handleStatusUpdate(change.value as TemplateStatusUpdateValue, db);
+      return;
     case 'message_template_quality_update':
-      await handleQualityUpdate(
-        change.value as TemplateQualityUpdateValue,
-        supabase,
-      )
-      return
+      await handleQualityUpdate(change.value as TemplateQualityUpdateValue, db);
+      return;
     case 'message_template_components_update':
-      handleComponentsUpdate(
-        change.value as TemplateComponentsUpdateValue,
-      )
-      return
+      handleComponentsUpdate(change.value as TemplateComponentsUpdateValue);
+      return;
   }
 }
 
 async function handleStatusUpdate(
   value: TemplateStatusUpdateValue,
-  supabase: SupabaseClient,
+  db: DrizzleDb
 ): Promise<void> {
   const metaTemplateId =
     value.message_template_id !== undefined
       ? String(value.message_template_id)
-      : null
+      : null;
   if (!metaTemplateId || !value.event) {
     console.warn(
       '[template-webhook] status update missing message_template_id or event:',
-      value,
-    )
-    return
+      value
+    );
+    return;
   }
 
-  const status = normalizeStatus(value.event)
+  const status = normalizeStatus(value.event);
 
   // Persist the rejection reason on REJECTED — that's the only event
   // where Meta sends a human-readable explanation. Clear it on any
   // other status flip so the UI doesn't show a stale REJECTED banner
   // after Meta re-approves a resubmitted template.
-  const update: Record<string, unknown> = {
+  const update = {
     status,
-    rejection_reason:
-      status === 'REJECTED' ? value.reason ?? 'Rejected by Meta' : null,
-    submission_error: null,
-  }
+    rejectionReason:
+      status === 'REJECTED' ? (value.reason ?? 'Rejected by Meta') : null,
+    submissionError: null,
+  };
 
-  const { data, error } = await supabase
-    .from('message_templates')
-    .update(update)
-    .eq('meta_template_id', metaTemplateId)
-    .select('id')
-
-  if (error) {
+  let data: { id: string }[];
+  try {
+    data = await db
+      .update(messageTemplates)
+      .set(update)
+      .where(eq(messageTemplates.metaTemplateId, metaTemplateId))
+      .returning({ id: messageTemplates.id });
+  } catch (error) {
     console.error(
       '[template-webhook] status update failed for meta_template_id',
       metaTemplateId,
-      error.message,
-    )
-    return
+      (error as { message?: string }).message ?? error
+    );
+    return;
   }
   if (!data || data.length === 0) {
     console.warn(
       '[template-webhook] status update received for unknown template:',
       metaTemplateId,
-      value.message_template_name,
-    )
-    return
+      value.message_template_name
+    );
+    return;
   }
   if (data.length > 1) {
     console.warn(
-      `[template-webhook] status update matched ${data.length} rows for meta_template_id ${metaTemplateId} — investigate.`,
-    )
+      `[template-webhook] status update matched ${data.length} rows for meta_template_id ${metaTemplateId} — investigate.`
+    );
   }
 }
 
 async function handleQualityUpdate(
   value: TemplateQualityUpdateValue,
-  supabase: SupabaseClient,
+  db: DrizzleDb
 ): Promise<void> {
   const metaTemplateId =
     value.message_template_id !== undefined
       ? String(value.message_template_id)
-      : null
+      : null;
   if (!metaTemplateId) {
     console.warn(
       '[template-webhook] quality update missing message_template_id:',
-      value,
-    )
-    return
+      value
+    );
+    return;
   }
 
-  const raw = value.new_quality_score
+  const raw = value.new_quality_score;
   const score =
     raw && ['GREEN', 'YELLOW', 'RED'].includes(raw.toUpperCase())
       ? (raw.toUpperCase() as 'GREEN' | 'YELLOW' | 'RED')
-      : null
+      : null;
 
-  const { error } = await supabase
-    .from('message_templates')
-    .update({ quality_score: score })
-    .eq('meta_template_id', metaTemplateId)
-
-  if (error) {
+  try {
+    await db
+      .update(messageTemplates)
+      .set({ qualityScore: score })
+      .where(eq(messageTemplates.metaTemplateId, metaTemplateId));
+  } catch (error) {
     console.error(
       '[template-webhook] quality update failed for meta_template_id',
       metaTemplateId,
-      error.message,
-    )
+      (error as { message?: string }).message ?? error
+    );
   }
 }
 
@@ -210,6 +204,6 @@ function handleComponentsUpdate(value: TemplateComponentsUpdateValue): void {
     '[template-webhook] components updated by Meta for template',
     value.message_template_id,
     value.message_template_name,
-    '— run "Sync from Meta" in Settings to pull the new components.',
-  )
+    '— run "Sync from Meta" in Settings to pull the new components.'
+  );
 }

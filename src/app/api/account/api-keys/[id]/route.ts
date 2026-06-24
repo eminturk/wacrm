@@ -13,8 +13,10 @@
 // ============================================================
 
 import { NextResponse } from 'next/server';
+import { and, eq, isNull } from 'drizzle-orm';
 
 import { requireRole, toErrorResponse } from '@/lib/auth/account';
+import { apiKeys } from '@/lib/db/schema';
 import {
   checkRateLimit,
   rateLimitResponse,
@@ -37,19 +39,23 @@ export async function DELETE(
     const { id } = await params;
 
     // Scope the update by account_id as well as id so an admin can
-    // never revoke another account's key by guessing a UUID. (RLS
-    // already enforces this; the explicit filter is belt-and-braces
-    // and makes the "0 rows updated → 404" path precise.)
-    const { data, error } = await ctx.supabase
-      .from('api_keys')
-      .update({ revoked_at: new Date().toISOString() })
-      .eq('id', id)
-      .eq('account_id', ctx.accountId)
-      .is('revoked_at', null)
-      .select('id')
-      .maybeSingle();
-
-    if (error) {
+    // never revoke another account's key by guessing a UUID. The
+    // explicit filter makes the "0 rows updated → 404" path precise.
+    let data;
+    try {
+      const rows = await ctx.db
+        .update(apiKeys)
+        .set({ revokedAt: new Date() })
+        .where(
+          and(
+            eq(apiKeys.id, id),
+            eq(apiKeys.accountId, ctx.accountId),
+            isNull(apiKeys.revokedAt),
+          ),
+        )
+        .returning({ id: apiKeys.id });
+      data = rows[0];
+    } catch (error) {
       console.error('[DELETE /api/account/api-keys/[id]] error:', error);
       return NextResponse.json(
         { error: 'Failed to revoke API key' },

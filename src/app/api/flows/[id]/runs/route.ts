@@ -1,86 +1,100 @@
 import { NextResponse } from 'next/server'
-import { createClient } from '@/lib/supabase/server'
+import { and, asc, desc, eq, inArray } from 'drizzle-orm'
+import { getSession } from '@/lib/auth/session'
+import { db } from '@/lib/db'
+import { contacts, flowRunEvents, flowRuns, flows } from '@/lib/db/schema'
 
-/**
- * GET /api/flows/[id]/runs
- *
- * Newest-first list of flow runs for a single flow, with the latest
- * event timeline embedded for each. Used by the run-history viewer
- * page (`/flows/[id]/runs`) to give the owner end-to-end visibility
- * into what the bot did with each customer.
- *
- * RLS does the ownership check (flow_runs has a `user_id` policy);
- * we also gate on the per-account beta flag so the route 404s for
- * non-beta accounts matching the rest of /api/flows.
- *
- * Limited to the 50 most recent runs. Pagination can come later;
- * the dashboard surface here is for debugging, not heavy querying.
- */
 export async function GET(
   _request: Request,
   context: { params: Promise<{ id: string }> },
 ) {
-  const { id } = await context.params
+  try {
+    const { id } = await context.params
 
-  const supabase = await createClient()
-  const {
-    data: { user },
-  } = await supabase.auth.getUser()
-  if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
-
-  // Confirm flow exists + caller owns it (RLS does this) before doing
-  // the run query — gives us a clean 404 instead of empty array.
-  const { data: flow } = await supabase
-    .from('flows')
-    .select('id, name')
-    .eq('id', id)
-    .maybeSingle()
-  if (!flow) {
-    return NextResponse.json({ error: 'Not found' }, { status: 404 })
-  }
-
-  // Pull runs + each run's contact name + each run's events. Two
-  // joined selects keep the round-trip count to the runs query + one
-  // per-run events query.
-  const { data: runs, error: runsErr } = await supabase
-    .from('flow_runs')
-    .select(
-      'id, status, current_node_key, started_at, last_advanced_at, ended_at, end_reason, vars, reprompt_count, contact:contacts(id, name, phone)',
-    )
-    .eq('flow_id', id)
-    .order('started_at', { ascending: false })
-    .limit(50)
-  if (runsErr) {
-    return NextResponse.json({ error: runsErr.message }, { status: 500 })
-  }
-
-  const runIds = (runs ?? []).map((r) => (r as { id: string }).id)
-  let events: Array<{
-    flow_run_id: string
-    event_type: string
-    node_key: string | null
-    payload: Record<string, unknown>
-    created_at: string
-  }> = []
-  if (runIds.length > 0) {
-    const { data: evs, error: evsErr } = await supabase
-      .from('flow_run_events')
-      .select('flow_run_id, event_type, node_key, payload, created_at')
-      .in('flow_run_id', runIds)
-      .order('created_at', { ascending: true })
-    if (evsErr) {
-      // Non-fatal — the page can still show runs without timelines.
-      console.error('[flows-runs] events fetch failed:', evsErr.message)
-    } else if (evs) {
-      events = evs as typeof events
+    const user = await getSession()
+    if (!user) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
-  }
 
-  return NextResponse.json({
-    flow,
-    runs: runs ?? [],
-    events,
-  })
+    const [flow] = await db
+      .select({ id: flows.id, name: flows.name })
+      .from(flows)
+      .where(and(eq(flows.id, id), eq(flows.userId, user.id)))
+      .limit(1)
+    if (!flow) {
+      return NextResponse.json({ error: 'Not found' }, { status: 404 })
+    }
+
+    const runRows = await db
+      .select({
+        id: flowRuns.id,
+        status: flowRuns.status,
+        current_node_key: flowRuns.currentNodeKey,
+        started_at: flowRuns.startedAt,
+        last_advanced_at: flowRuns.lastAdvancedAt,
+        ended_at: flowRuns.endedAt,
+        end_reason: flowRuns.endReason,
+        vars: flowRuns.vars,
+        reprompt_count: flowRuns.repromptCount,
+        contact_id: contacts.id,
+        contact_name: contacts.name,
+        contact_phone: contacts.phone,
+      })
+      .from(flowRuns)
+      .leftJoin(contacts, eq(flowRuns.contactId, contacts.id))
+      .where(eq(flowRuns.flowId, id))
+      .orderBy(desc(flowRuns.startedAt))
+      .limit(50)
+
+    const runs = runRows.map((r) => ({
+      id: r.id,
+      status: r.status,
+      current_node_key: r.current_node_key,
+      started_at: r.started_at,
+      last_advanced_at: r.last_advanced_at,
+      ended_at: r.ended_at,
+      end_reason: r.end_reason,
+      vars: r.vars,
+      reprompt_count: r.reprompt_count,
+      contact: r.contact_id
+        ? { id: r.contact_id, name: r.contact_name, phone: r.contact_phone }
+        : null,
+    }))
+
+    const runIds = runs.map((r) => r.id)
+    let events: Array<{
+      flow_run_id: string
+      event_type: string
+      node_key: string | null
+      payload: Record<string, unknown>
+      created_at: Date | null
+    }> = []
+    if (runIds.length > 0) {
+      try {
+        events = await db
+          .select({
+            flow_run_id: flowRunEvents.flowRunId,
+            event_type: flowRunEvents.eventType,
+            node_key: flowRunEvents.nodeKey,
+            payload: flowRunEvents.payload,
+            created_at: flowRunEvents.createdAt,
+          })
+          .from(flowRunEvents)
+          .where(inArray(flowRunEvents.flowRunId, runIds))
+          .orderBy(asc(flowRunEvents.createdAt)) as typeof events
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        console.error('[flows-runs] events fetch failed:', message)
+      }
+    }
+
+    return NextResponse.json({
+      flow,
+      runs,
+      events,
+    })
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Internal server error'
+    return NextResponse.json({ error: message }, { status: 500 })
+  }
 }

@@ -1,5 +1,7 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import { NextResponse } from 'next/server'
-import { createClient } from '@/lib/supabase/server'
+import { db, sql } from '@/lib/db'
+import { getSession } from '@/lib/auth/session'
 import { decrypt } from '@/lib/whatsapp/encryption'
 import {
   deleteMessageTemplate,
@@ -11,6 +13,8 @@ import {
 } from '@/lib/whatsapp/template-validators'
 import { buildMetaTemplatePayload } from '@/lib/whatsapp/template-components'
 import { ensureImageHeaderHandle } from '@/lib/whatsapp/template-header-handle'
+
+type DbRow = Record<string, any>
 
 /**
  * Per-template lifecycle endpoint.
@@ -33,7 +37,7 @@ const EDITABLE_STATUSES = new Set(['APPROVED', 'REJECTED', 'PAUSED'])
 
 // uuid v4 plus the looser shape Postgres gen_random_uuid emits.
 // We don't need exhaustive RFC parsing — just enough to reject
-// "../etc/passwd"-style payloads before they hit Supabase.
+// "../etc/passwd"-style payloads before they hit the database.
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
@@ -42,6 +46,16 @@ function isDryRun(): boolean {
     process.env.WHATSAPP_TEMPLATES_DRY_RUN === 'true' ||
     process.env.WHATSAPP_TEMPLATES_DRY_RUN === '1'
   )
+}
+
+async function resolveAccountId(userId: string): Promise<string | null> {
+  const rows = (await db.execute(sql`
+    SELECT account_id
+    FROM profiles
+    WHERE user_id = ${userId}
+    LIMIT 1
+  `)) as DbRow[]
+  return rows[0]?.account_id ?? null
 }
 
 export async function PATCH(
@@ -56,23 +70,14 @@ export async function PATCH(
         { status: 400 },
       )
     }
-    const supabase = await createClient()
-    const {
-      data: { user },
-      error: authError,
-    } = await supabase.auth.getUser()
-    if (authError || !user) {
+    const user = await getSession()
+    if (!user) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
     // Resolve the caller's account_id so template + whatsapp_config
     // lookups work for teammates who didn't author the row.
-    const { data: profile } = await supabase
-      .from('profiles')
-      .select('account_id')
-      .eq('user_id', user.id)
-      .maybeSingle()
-    const accountId = profile?.account_id as string | undefined
+    const accountId = await resolveAccountId(user.id)
     if (!accountId) {
       return NextResponse.json(
         { error: 'Your profile is not linked to an account.' },
@@ -87,15 +92,17 @@ export async function PATCH(
       return NextResponse.json({ error: 'Invalid JSON body.' }, { status: 400 })
     }
 
-    // RLS handles ownership, but we need the existing row to read
+    // Account scoping handles ownership, but we need the existing row to read
     // meta_template_id and status — fetch explicitly.
-    const { data: existing, error: lookupErr } = await supabase
-      .from('message_templates')
-      .select('id, name, status, meta_template_id, language')
-      .eq('id', id)
-      .eq('account_id', accountId)
-      .maybeSingle()
-    if (lookupErr || !existing) {
+    const existingRows = (await db.execute(sql`
+      SELECT id, name, status, meta_template_id, language
+      FROM message_templates
+      WHERE id = ${id}
+        AND account_id = ${accountId}
+      LIMIT 1
+    `)) as DbRow[]
+    const existing = existingRows[0]
+    if (!existing) {
       return NextResponse.json({ error: 'Template not found.' }, { status: 404 })
     }
 
@@ -138,12 +145,14 @@ export async function PATCH(
     }
 
     if (!isDryRun()) {
-      const { data: config, error: configError } = await supabase
-        .from('whatsapp_config')
-        .select('*')
-        .eq('account_id', accountId)
-        .single()
-      if (configError || !config) {
+      const configRows = (await db.execute(sql`
+        SELECT *
+        FROM whatsapp_config
+        WHERE account_id = ${accountId}
+        LIMIT 1
+      `)) as DbRow[]
+      const config = configRows[0]
+      if (!config) {
         return NextResponse.json(
           { error: 'WhatsApp not configured.' },
           { status: 400 },
@@ -171,43 +180,47 @@ export async function PATCH(
         })
       } catch (e) {
         const message = e instanceof Error ? e.message : 'Meta edit failed.'
-        await supabase
-          .from('message_templates')
-          .update({
-            submission_error: message,
-            last_submitted_at: new Date().toISOString(),
-          })
-          .eq('id', id)
+        await db.execute(sql`
+          UPDATE message_templates
+          SET submission_error = ${message},
+              last_submitted_at = NOW(),
+              updated_at = NOW()
+          WHERE id = ${id}
+            AND account_id = ${accountId}
+        `)
         return NextResponse.json({ error: message }, { status: 502 })
       }
     }
 
     // Meta accepted the edit — status flips back to PENDING for review.
-    const { data: row, error: updErr } = await supabase
-      .from('message_templates')
-      .update({
-        category: payload.category,
-        header_type: payload.header_type ?? null,
-        header_content: payload.header_content ?? null,
-        header_media_url: payload.header_media_url ?? null,
-        header_handle: payload.header_handle ?? null,
-        body_text: payload.body_text,
-        footer_text: payload.footer_text ?? null,
-        buttons: payload.buttons ?? null,
-        sample_values: payload.sample_values ?? null,
-        status: 'PENDING',
-        submission_error: null,
-        rejection_reason: null,
-        last_submitted_at: new Date().toISOString(),
-      })
-      .eq('id', id)
-      .select()
-      .single()
-
-    if (updErr) {
+    let row: DbRow
+    try {
+      const rows = (await db.execute(sql`
+        UPDATE message_templates
+        SET category = ${payload.category},
+            header_type = ${payload.header_type ?? null},
+            header_content = ${payload.header_content ?? null},
+            header_media_url = ${payload.header_media_url ?? null},
+            header_handle = ${payload.header_handle ?? null},
+            body_text = ${payload.body_text},
+            footer_text = ${payload.footer_text ?? null},
+            buttons = ${payload.buttons ? JSON.stringify(payload.buttons) : null}::jsonb,
+            sample_values = ${payload.sample_values ? JSON.stringify(payload.sample_values) : null}::jsonb,
+            status = 'PENDING',
+            submission_error = NULL,
+            rejection_reason = NULL,
+            last_submitted_at = NOW(),
+            updated_at = NOW()
+        WHERE id = ${id}
+          AND account_id = ${accountId}
+        RETURNING *
+      `)) as DbRow[]
+      row = rows[0]
+    } catch (updErr) {
+      const message = updErr instanceof Error ? updErr.message : String(updErr)
       return NextResponse.json(
         {
-          error: `Edited on Meta but failed to save locally: ${updErr.message}. Run "Sync from Meta" to recover.`,
+          error: `Edited on Meta but failed to save locally: ${message}. Run "Sync from Meta" to recover.`,
         },
         { status: 500 },
       )
@@ -242,24 +255,15 @@ export async function DELETE(
         { status: 400 },
       )
     }
-    const supabase = await createClient()
-    const {
-      data: { user },
-      error: authError,
-    } = await supabase.auth.getUser()
-    if (authError || !user) {
+    const user = await getSession()
+    if (!user) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
     // Same account-scoping rationale as the PATCH handler above —
     // teammates need to be able to operate on shared templates +
     // the shared whatsapp_config.
-    const { data: profile } = await supabase
-      .from('profiles')
-      .select('account_id')
-      .eq('user_id', user.id)
-      .maybeSingle()
-    const accountId = profile?.account_id as string | undefined
+    const accountId = await resolveAccountId(user.id)
     if (!accountId) {
       return NextResponse.json(
         { error: 'Your profile is not linked to an account.' },
@@ -267,23 +271,27 @@ export async function DELETE(
       )
     }
 
-    const { data: existing, error: lookupErr } = await supabase
-      .from('message_templates')
-      .select('id, name, meta_template_id')
-      .eq('id', id)
-      .eq('account_id', accountId)
-      .maybeSingle()
-    if (lookupErr || !existing) {
+    const existingRows = (await db.execute(sql`
+      SELECT id, name, meta_template_id
+      FROM message_templates
+      WHERE id = ${id}
+        AND account_id = ${accountId}
+      LIMIT 1
+    `)) as DbRow[]
+    const existing = existingRows[0]
+    if (!existing) {
       return NextResponse.json({ error: 'Template not found.' }, { status: 404 })
     }
 
     if (existing.meta_template_id && !isDryRun()) {
-      const { data: config, error: configError } = await supabase
-        .from('whatsapp_config')
-        .select('*')
-        .eq('account_id', accountId)
-        .single()
-      if (configError || !config || !config.waba_id) {
+      const configRows = (await db.execute(sql`
+        SELECT *
+        FROM whatsapp_config
+        WHERE account_id = ${accountId}
+        LIMIT 1
+      `)) as DbRow[]
+      const config = configRows[0]
+      if (!config || !config.waba_id) {
         return NextResponse.json(
           { error: 'WhatsApp not configured — cannot delete on Meta.' },
           { status: 400 },
@@ -303,14 +311,17 @@ export async function DELETE(
       }
     }
 
-    const { error: delErr } = await supabase
-      .from('message_templates')
-      .delete()
-      .eq('id', id)
-    if (delErr) {
+    try {
+      await db.execute(sql`
+        DELETE FROM message_templates
+        WHERE id = ${id}
+          AND account_id = ${accountId}
+      `)
+    } catch (delErr) {
+      const message = delErr instanceof Error ? delErr.message : String(delErr)
       return NextResponse.json(
         {
-          error: `Deleted on Meta but failed to delete locally: ${delErr.message}.`,
+          error: `Deleted on Meta but failed to delete locally: ${message}.`,
         },
         { status: 500 },
       )

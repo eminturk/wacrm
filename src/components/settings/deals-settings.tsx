@@ -4,7 +4,6 @@ import { useEffect, useState } from "react";
 import { toast } from "sonner";
 import { Coins, Loader2 } from "lucide-react";
 
-import { createClient } from "@/lib/supabase/client";
 import { useAuth } from "@/hooks/use-auth";
 import { CURRENCIES } from "@/lib/currency";
 import { Button } from "@/components/ui/button";
@@ -28,7 +27,6 @@ import { SettingsPanelHead } from "./settings-panel-head";
  * admins+, so non-admins see a disabled, read-only control.
  */
 export function DealsSettings() {
-  const supabase = createClient();
   const {
     accountId,
     defaultCurrency,
@@ -51,11 +49,12 @@ export function DealsSettings() {
   async function handleSave() {
     if (!accountId || !dirty) return;
     setSaving(true);
-    const { error } = await supabase
-      .from("accounts")
-      .update({ default_currency: selected })
-      .eq("id", accountId);
-    if (error) {
+    const res = await fetch('/api/settings/profile', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ default_currency: selected }),
+    });
+    if (!res.ok) {
       toast.error("Failed to save default currency");
       setSaving(false);
       return;

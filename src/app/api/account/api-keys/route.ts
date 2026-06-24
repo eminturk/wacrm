@@ -18,12 +18,14 @@
 // ============================================================
 
 import { NextResponse } from 'next/server';
+import { eq, desc } from 'drizzle-orm';
 
 import {
   getCurrentAccount,
   requireRole,
   toErrorResponse,
 } from '@/lib/auth/account';
+import { apiKeys } from '@/lib/db/schema';
 import { generateApiKey } from '@/lib/api-keys/keys';
 import { normalizeScopes } from '@/lib/api-keys/scopes';
 import {
@@ -39,22 +41,31 @@ const MAX_EXPIRY_DAYS = 365;
 
 // Columns safe to expose. `key_hash` is deliberately excluded — it
 // never leaves the server.
-const SAFE_COLUMNS =
-  'id, name, key_prefix, scopes, last_used_at, expires_at, revoked_at, created_at';
+const SAFE_COLUMNS = {
+  id: apiKeys.id,
+  name: apiKeys.name,
+  key_prefix: apiKeys.keyPrefix,
+  scopes: apiKeys.scopes,
+  last_used_at: apiKeys.lastUsedAt,
+  expires_at: apiKeys.expiresAt,
+  revoked_at: apiKeys.revokedAt,
+  created_at: apiKeys.createdAt,
+} as const;
 
 export async function GET() {
   try {
-    // Any member can view the roster (RLS allows it); we just need a
-    // resolved account context.
+    // Any member can view the roster; we just need a resolved account
+    // context.
     const ctx = await getCurrentAccount();
 
-    const { data, error } = await ctx.supabase
-      .from('api_keys')
-      .select(SAFE_COLUMNS)
-      .eq('account_id', ctx.accountId)
-      .order('created_at', { ascending: false });
-
-    if (error) {
+    let data;
+    try {
+      data = await ctx.db
+        .select(SAFE_COLUMNS)
+        .from(apiKeys)
+        .where(eq(apiKeys.accountId, ctx.accountId))
+        .orderBy(desc(apiKeys.createdAt));
+    } catch (error) {
       console.error('[GET /api/account/api-keys] fetch error:', error);
       return NextResponse.json(
         { error: 'Failed to load API keys' },
@@ -108,7 +119,7 @@ export async function POST(request: Request) {
       );
     }
 
-    let expiresAt: string | null = null;
+    let expiresAt: Date | null = null;
     const rawExpiry = body?.expiresInDays;
     if (
       typeof rawExpiry === 'number' &&
@@ -116,29 +127,36 @@ export async function POST(request: Request) {
       rawExpiry > 0
     ) {
       const days = Math.min(Math.floor(rawExpiry), MAX_EXPIRY_DAYS);
-      expiresAt = new Date(
-        Date.now() + days * 24 * 60 * 60 * 1000
-      ).toISOString();
+      expiresAt = new Date(Date.now() + days * 24 * 60 * 60 * 1000);
     }
 
     const { plaintext, hash, prefix } = generateApiKey();
 
-    const { data, error } = await ctx.supabase
-      .from('api_keys')
-      .insert({
-        account_id: ctx.accountId,
-        created_by: ctx.userId,
-        name: rawName,
-        key_prefix: prefix,
-        key_hash: hash,
-        scopes,
-        expires_at: expiresAt,
-      })
-      .select(SAFE_COLUMNS)
-      .single();
-
-    if (error || !data) {
+    let data;
+    try {
+      const rows = await ctx.db
+        .insert(apiKeys)
+        .values({
+          accountId: ctx.accountId,
+          createdBy: ctx.userId,
+          name: rawName,
+          keyPrefix: prefix,
+          keyHash: hash,
+          scopes,
+          expiresAt,
+        })
+        .returning(SAFE_COLUMNS);
+      data = rows[0];
+    } catch (error) {
       console.error('[POST /api/account/api-keys] insert error:', error);
+      return NextResponse.json(
+        { error: 'Failed to create API key' },
+        { status: 500 }
+      );
+    }
+
+    if (!data) {
+      console.error('[POST /api/account/api-keys] insert returned no row');
       return NextResponse.json(
         { error: 'Failed to create API key' },
         { status: 500 }

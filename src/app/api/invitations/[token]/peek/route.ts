@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 // ============================================================
 // GET /api/invitations/[token]/peek
 //
@@ -11,10 +12,8 @@
 //     `?token=` would.
 //   - The plaintext token never crosses the DB boundary — we
 //     hash it in TS first and look up by `token_hash`.
-//   - The peek RPC is SECURITY DEFINER so it bypasses the RLS
-//     that would otherwise block an anonymous SELECT on
-//     `account_invitations`. It returns a fixed-shape JSON
-//     payload that never leaks columns beyond what the join
+//   - The peek function is SECURITY DEFINER so it returns a fixed-shape
+//     JSON payload that never leaks columns beyond what the join
 //     page renders.
 //   - Per-IP rate limit pinches brute-force enumeration of
 //     tokens. With 256 bits of entropy the enumeration risk is
@@ -29,7 +28,9 @@ import {
   rateLimitResponse,
   RATE_LIMITS,
 } from "@/lib/rate-limit";
-import { createClient } from "@/lib/supabase/server";
+import { db, sql } from "@/lib/db";
+
+type DbRow = Record<string, any>;
 
 /**
  * Best-effort client IP. The `x-forwarded-for` header is what
@@ -68,20 +69,19 @@ export async function GET(
     );
   }
 
-  const supabase = await createClient();
-  const { data, error } = await supabase.rpc("peek_invitation", {
-    p_token_hash: hashInviteToken(token),
-  });
+  try {
+    const rows = (await db.execute(sql`
+      SELECT public.peek_invitation(${hashInviteToken(token)}) AS data
+    `)) as DbRow[];
 
-  if (error) {
-    console.error("[peek] rpc error:", error);
+    // The function always returns a json object — either ok:true with
+    // metadata or ok:false with a reason. Forward verbatim.
+    return NextResponse.json(rows[0]?.data ?? { ok: false, reason: "not_found" });
+  } catch (error) {
+    console.error("[peek] function error:", error);
     return NextResponse.json(
       { ok: false, reason: "server_error" },
       { status: 500 },
     );
   }
-
-  // The RPC always returns a json object — either ok:true with
-  // metadata or ok:false with a reason. Forward verbatim.
-  return NextResponse.json(data);
 }

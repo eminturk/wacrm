@@ -2,8 +2,6 @@
 
 import { useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { createClient } from '@/lib/supabase/client';
-import { useAuth } from '@/hooks/use-auth';
 import { toast } from 'sonner';
 import { MessageTemplate } from '@/types';
 import { Step1ChooseTemplate } from '@/components/broadcasts/step1-choose-template';
@@ -22,8 +20,8 @@ const steps = [
 
 export default function NewBroadcastPage() {
   const router = useRouter();
-  const { accountId } = useAuth();
-  const { createAndSendBroadcast, isProcessing, progress } = useBroadcastSending();
+  const { createAndSendBroadcast, isProcessing, progress } =
+    useBroadcastSending();
 
   const [currentStep, setCurrentStep] = useState(0);
   const [template, setTemplate] = useState<MessageTemplate | null>(null);
@@ -83,42 +81,27 @@ export default function NewBroadcastPage() {
       toast.error('Give the broadcast a name before saving a draft.');
       return;
     }
-    const supabase = createClient();
-    const {
-      data: { session },
-    } = await supabase.auth.getSession();
-    const user = session?.user;
-    if (!user) {
-      toast.error('Not signed in.');
-      return;
-    }
-    if (!accountId) {
-      toast.error('Your profile is not linked to an account.');
-      return;
-    }
-
-    const { error } = await supabase.from('broadcasts').insert({
-      user_id: user.id,
-      account_id: accountId,
-      name: name.trim(),
-      template_name: template.name,
-      template_language: template.language ?? 'en_US',
-      template_variables: variables,
-      audience_filter: {
-        type: audience.type,
-        tagIds: audience.tagIds,
-      },
-      status: 'draft',
-      total_recipients: 0,
-      sent_count: 0,
-      delivered_count: 0,
-      read_count: 0,
-      replied_count: 0,
-      failed_count: 0,
+    const res = await fetch('/api/broadcasts', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: name.trim(),
+        template_name: template.name,
+        template_language: template.language ?? 'en_US',
+        template_variables: variables,
+        audience_filter: {
+          type: audience.type,
+          tagIds: audience.tagIds,
+          customField: audience.customField,
+          excludeTagIds: audience.excludeTagIds,
+        },
+        status: 'draft',
+      }),
     });
+    const data = await res.json();
 
-    if (error) {
-      toast.error(`Failed to save draft: ${error.message}`);
+    if (!res.ok) {
+      toast.error(`Failed to save draft: ${data.error || 'unknown error'}`);
       return;
     }
     toast.success('Draft saved');
@@ -129,8 +112,8 @@ export default function NewBroadcastPage() {
     <div className="mx-auto max-w-3xl space-y-8">
       {/* Header */}
       <div>
-        <h1 className="text-2xl font-bold text-foreground">New Broadcast</h1>
-        <p className="mt-1 text-sm text-muted-foreground">
+        <h1 className="text-foreground text-2xl font-bold">New Broadcast</h1>
+        <p className="text-muted-foreground mt-1 text-sm">
           Create and send a broadcast message to your contacts.
         </p>
       </div>
@@ -149,15 +132,19 @@ export default function NewBroadcastPage() {
                     isCompleted
                       ? 'bg-primary text-primary-foreground'
                       : isActive
-                        ? 'border-2 border-primary bg-primary/10 text-primary'
-                        : 'border border-border bg-muted text-muted-foreground'
+                        ? 'border-primary bg-primary/10 text-primary border-2'
+                        : 'border-border bg-muted text-muted-foreground border'
                   }`}
                 >
                   {isCompleted ? <Check className="h-4 w-4" /> : index + 1}
                 </div>
                 <span
                   className={`hidden text-sm font-medium sm:block ${
-                    isActive ? 'text-foreground' : isCompleted ? 'text-primary' : 'text-muted-foreground'
+                    isActive
+                      ? 'text-foreground'
+                      : isCompleted
+                        ? 'text-primary'
+                        : 'text-muted-foreground'
                   }`}
                 >
                   {step.label}

@@ -1,7 +1,6 @@
 "use client";
 
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
-import { createClient } from "@/lib/supabase/client";
 import { cn } from "@/lib/utils";
 import type { Conversation, ConversationStatus } from "@/types";
 import { Search, ChevronDown } from "lucide-react";
@@ -75,30 +74,24 @@ export function ConversationList({
   });
 
   useEffect(() => {
-    const supabase = createClient();
     let cancelled = false;
 
     (async () => {
-      const { data, error } = await supabase
-        .from("conversations")
-        .select("*, contact:contacts(*)")
-        .order("last_message_at", { ascending: false });
+      const params = new URLSearchParams();
+      if (search.trim()) params.set("search", search.trim());
+      if (filter !== "all") params.set("filter", filter);
+      const res = await fetch(`/api/conversations${params.size ? `?${params}` : ""}`);
+      const payload = await res.json().catch(() => ({}));
 
       if (cancelled) return;
 
-      if (error) {
-        // Supabase errors have non-enumerable properties — log fields explicitly
-        console.error("Failed to fetch conversations:", {
-          message: error.message,
-          details: error.details,
-          hint: error.hint,
-          code: error.code,
-        });
+      if (!res.ok) {
+        console.error("Failed to fetch conversations:", payload?.error || `HTTP ${res.status}`);
         setLoading(false);
         return;
       }
 
-      onConversationsLoadedRef.current(data ?? []);
+      onConversationsLoadedRef.current(payload.conversations ?? []);
       setLoading(false);
     })();
 
@@ -108,7 +101,7 @@ export function ConversationList({
     // `resyncToken` is included so the parent can force a refetch when
     // the realtime channel reconnects or the tab regains focus — catches
     // up on any events sent while the WS was disconnected or throttled.
-  }, [resyncToken]);
+  }, [resyncToken, search, filter]);
 
   const filtered = useMemo(() => {
     let result = conversations;
