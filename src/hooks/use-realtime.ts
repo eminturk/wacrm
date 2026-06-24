@@ -34,7 +34,6 @@ interface NotifyPayload {
  * row. `new`/`old` are populated with the ids that are available.
  */
 export function useRealtime({
-  channelName: _channelName,
   onMessageEvent,
   onConversationEvent,
   enabled = true,

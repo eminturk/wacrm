@@ -66,8 +66,8 @@ export async function findActiveKeyByHash(
     created_by: data.createdBy,
     name: data.name,
     scopes: data.scopes ?? [],
-    expires_at: data.expiresAt ? data.expiresAt.toISOString() : null,
-    revoked_at: data.revokedAt ? data.revokedAt.toISOString() : null,
+    expires_at: data.expiresAt ? new Date(data.expiresAt).toISOString() : null,
+    revoked_at: data.revokedAt ? new Date(data.revokedAt).toISOString() : null,
   };
 }
 
