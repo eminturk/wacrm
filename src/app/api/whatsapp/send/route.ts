@@ -162,6 +162,15 @@ export async function POST(request: Request) {
       )
     }
 
+    // Block sends to opted-out contacts — enforces "opt-out işlemlerini
+    // anlık uygulayabilme" from the technical spec.
+    if (contact.opted_out) {
+      return NextResponse.json(
+        { error: 'Contact has opted out of WhatsApp messages and cannot be messaged.' },
+        { status: 422 }
+      )
+    }
+
     // Sanitize and validate phone
     const sanitizedPhone = sanitizePhoneForMeta(contact.phone)
     if (!isValidE164(sanitizedPhone)) {

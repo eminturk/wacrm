@@ -187,6 +187,25 @@ export async function POST(request: Request) {
     let sentCount = 0
     let failedCount = 0
 
+    // Build a lookup set of opted-out phone numbers to skip.
+    // We check phone_normalized for the opt-out flag — E.164 format.
+    const allPhones = recipients.map((r) => sanitizePhoneForMeta(r.phone)).filter(Boolean)
+    let optedOutPhones = new Set<string>()
+    if (allPhones.length > 0) {
+      try {
+        const optedOutRows = (await db.execute(sql`
+          SELECT phone_normalized
+          FROM contacts
+          WHERE account_id = ${accountId}
+            AND opted_out = true
+            AND phone_normalized = ANY(${allPhones}::text[])
+        `)) as Array<{ phone_normalized: string }>
+        optedOutPhones = new Set(optedOutRows.map((r) => r.phone_normalized))
+      } catch (err) {
+        console.error('[broadcast] opted_out lookup failed:', err)
+      }
+    }
+
     for (const recipient of recipients) {
       const sanitized = sanitizePhoneForMeta(recipient.phone)
 
@@ -195,6 +214,17 @@ export async function POST(request: Request) {
           phone: recipient.phone,
           status: 'failed',
           error: 'Invalid phone number format',
+        })
+        failedCount++
+        continue
+      }
+
+      // Skip opted-out contacts — enforce WhatsApp opt-out spec requirement.
+      if (optedOutPhones.has(sanitized)) {
+        results.push({
+          phone: recipient.phone,
+          status: 'failed',
+          error: 'Contact has opted out of WhatsApp messages',
         })
         failedCount++
         continue

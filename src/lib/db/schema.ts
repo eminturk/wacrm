@@ -26,6 +26,25 @@ import {
   index,
 } from 'drizzle-orm/pg-core'
 
+// ---- helper for text[] columns (Drizzle doesn't ship a pg-array helper yet)
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+import { customType } from 'drizzle-orm/pg-core'
+
+const textArray = customType<{ data: string[]; driverData: string }>({
+  dataType() {
+    return 'text[]'
+  },
+  toDriver(value: string[]) {
+    // postgres.js accepts native JS arrays for array columns
+    return value as unknown as string
+  },
+  fromDriver(value: string): string[] {
+    // postgres.js returns JS arrays from the driver directly
+    if (Array.isArray(value)) return value as unknown as string[]
+    return []
+  },
+})
+
 // ------------------------------------------------------------
 // Enums
 // ------------------------------------------------------------
@@ -70,6 +89,8 @@ export const accounts = pgTable('accounts', {
     .notNull()
     .references(() => users.id, { onDelete: 'restrict' }),
   defaultCurrency: text('default_currency').notNull().default('USD'),
+  /** Empty array = allow all. Non-empty = restrict to listed IPs/CIDRs. */
+  ipAllowlist: textArray('ip_allowlist').notNull().default([]),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
 })
@@ -134,6 +155,9 @@ export const contacts = pgTable(
     email: text('email'),
     company: text('company'),
     avatarUrl: text('avatar_url'),
+    /** True when the contact has opted out of WhatsApp marketing messages. */
+    optedOut: boolean('opted_out').notNull().default(false),
+    optedOutAt: timestamp('opted_out_at', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow(),
   },
@@ -270,6 +294,8 @@ export const messages = pgTable(
     templateName: text('template_name'),
     messageId: text('message_id'),
     status: text('status').notNull().default('sent'),
+    /** Numeric Meta error code captured from webhook status events (e.g. 131026). */
+    errorCode: text('error_code'),
     replyToMessageId: uuid('reply_to_message_id'),
     interactiveReplyId: text('interactive_reply_id'),
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
@@ -468,6 +494,8 @@ export const broadcastRecipients = pgTable(
     readAt: timestamp('read_at', { withTimezone: true }),
     repliedAt: timestamp('replied_at', { withTimezone: true }),
     errorMessage: text('error_message'),
+    /** Numeric Meta error code (e.g. "131026") captured from webhook. */
+    errorCode: text('error_code'),
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
   },
   (t) => [index('idx_broadcast_recipients_broadcast').on(t.broadcastId)],
@@ -672,3 +700,31 @@ export const apiKeys = pgTable('api_keys', {
   revokedAt: timestamp('revoked_at', { withTimezone: true }),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 })
+
+// ============================================================
+// AUDIT LOGS (append-only, never updated/deleted)
+// ============================================================
+export const auditLogs = pgTable(
+  'audit_logs',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    accountId: uuid('account_id').references(() => accounts.id, {
+      onDelete: 'set null',
+    }),
+    userId: uuid('user_id').references(() => users.id, {
+      onDelete: 'set null',
+    }),
+    /** Action key, e.g. "login.success", "member.invite", "settings.update" */
+    action: text('action').notNull(),
+    resourceType: text('resource_type'),
+    resourceId: text('resource_id'),
+    metadata: jsonb('metadata').notNull().default({}),
+    ipAddress: text('ip_address'),
+    userAgent: text('user_agent'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    index('idx_audit_logs_account_created').on(t.accountId, t.createdAt),
+    index('idx_audit_logs_user_created').on(t.userId, t.createdAt),
+  ],
+)

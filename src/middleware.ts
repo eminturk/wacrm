@@ -63,6 +63,7 @@ export async function middleware(request: NextRequest) {
     '/broadcasts',
     '/automations',
     '/flows',
+    '/reports',
     '/settings',
   ]
   if (!authed && protectedPaths.some((p) => pathname.startsWith(p))) {

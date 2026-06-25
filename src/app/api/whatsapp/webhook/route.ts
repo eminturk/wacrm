@@ -21,6 +21,16 @@ import {
   handleTemplateWebhookChange,
   isTemplateWebhookField,
 } from '@/lib/whatsapp/template-webhook';
+import { writeAuditLog } from '@/lib/audit';
+
+/**
+ * Meta error codes that indicate the recipient has opted out of
+ * marketing/utility messages on WhatsApp.
+ *
+ * 131026 — Message Undeliverable: recipient blocked the sender.
+ * 131031 — Re-engagement message: marketing opt-out triggered.
+ */
+const OPT_OUT_ERROR_CODES = new Set([131026, 131031]);
 
 interface WhatsAppMessage {
   id: string;
@@ -79,6 +89,8 @@ interface WhatsAppWebhookEntry {
         status: string;
         timestamp: string;
         recipient_id: string;
+        /** Present on failed/errored statuses. */
+        errors?: Array<{ code: number; title?: string; message?: string }>;
       }>;
     };
     field: string;
@@ -341,19 +353,54 @@ async function handleStatusUpdate(status: {
   status: string;
   timestamp: string;
   recipient_id: string;
+  errors?: Array<{ code: number; title?: string; message?: string }>;
 }) {
+  // Capture the first Meta error code if present
+  const errorCode = status.errors?.[0]?.code != null
+    ? String(status.errors[0].code)
+    : null;
+
   // 1) Mirror onto messages (legacy behavior) — Meta's status values
   //    already match the CHECK constraint on messages.status.
   try {
     await db
       .update(messages)
-      .set({ status: status.status })
+      .set({
+        status: status.status,
+        ...(errorCode ? { errorCode } : {}),
+      })
       .where(eq(messages.messageId, status.id));
   } catch (msgErr) {
     console.error('Error updating message status:', msgErr);
   }
 
-  // 2) Mirror onto broadcast_recipients via whatsapp_message_id
+  // 2) Opt-out enforcement — if Meta reports an opt-out error code,
+  //    mark the contact as opted out immediately so subsequent sends
+  //    are blocked without another round-trip to Meta.
+  if (status.errors?.some((e) => OPT_OUT_ERROR_CODES.has(e.code))) {
+    try {
+      // Find the contact by phone (recipient_id is the E.164 number).
+      await db
+        .update(contacts)
+        .set({ optedOut: true, optedOutAt: new Date() })
+        .where(eq(contacts.phoneNormalized, status.recipient_id));
+
+      // Audit the opt-out event
+      void writeAuditLog({
+        action: 'contact.opted_out',
+        resourceType: 'contact',
+        metadata: {
+          phone: status.recipient_id,
+          errorCode,
+          source: 'webhook',
+        },
+      });
+    } catch (optOutErr) {
+      console.error('Error setting opted_out on contact:', optOutErr);
+    }
+  }
+
+  // 3) Mirror onto broadcast_recipients via whatsapp_message_id
   //    (added in migration 003). The aggregate trigger on
   //    broadcast_recipients re-derives the parent broadcast's
   //    sent/delivered/read/failed counts automatically.
@@ -381,6 +428,7 @@ async function handleStatusUpdate(status: {
 
   const update: Partial<typeof broadcastRecipients.$inferInsert> = {
     status: status.status,
+    ...(errorCode ? { errorCode } : {}),
   };
   if (status.status === 'sent') update.sentAt = ts;
   if (status.status === 'delivered') update.deliveredAt = ts;
