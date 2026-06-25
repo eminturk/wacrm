@@ -1,26 +1,23 @@
 /**
- * In-memory per-key rate limiter.
+ * Per-key rate limiter — Redis-backed when REDIS_URL is set, otherwise
+ * falls back to the original in-memory fixed-window implementation.
  *
- * Fixed-window counter (not token bucket): every identifier gets a
- * fresh N-request budget each window. Simple, allocation-light, and
- * fine for a single-instance VPS — which is how forkers of this
- * template will usually deploy.
+ * Redis mode:   uses a Lua INCR+EXPIRE script for atomic fixed-window
+ *               counting. Works correctly across multiple Node processes
+ *               and Vercel serverless instances.
  *
- * Trade-off: a single Node process holds the Map, so horizontal scale
- * (multiple regions, multiple Hostinger nodes, Vercel serverless fan-
- * out) silently defeats the limit. If you scale beyond one instance,
- * swap the `check` implementation for Redis / Upstash / Cloudflare
- * Durable Objects keeping the same return shape. The call sites won't
- * change.
+ * In-memory mode (fallback):
+ *               A single Node process holds the Map, so horizontal scale
+ *               silently defeats the limit. Suitable for single-instance
+ *               VPS deployments. No background timer — safe in serverless
+ *               runtimes that don't keep timers alive across requests.
  *
- * Memory: entries are ~50 bytes each. With LIGHT_SWEEP below, expired
- * keys get cleared opportunistically on every ~1 000th call, so a
- * healthy instance stays in the low-MB range even with thousands of
- * distinct users. No background timer — works in serverless edge
- * runtimes that don't keep timers alive across requests.
+ * The public interface (`checkRateLimit`, `rateLimitResponse`, `RATE_LIMITS`)
+ * is identical in both modes — call sites never change.
  */
 
 import { NextResponse } from 'next/server';
+import { redisEnabled, getRedis } from '@/lib/redis';
 
 export interface RateLimitOptions {
   /** Max requests allowed in `windowMs`. */
@@ -43,6 +40,62 @@ interface Entry {
   resetAt: number;
 }
 
+// ============================================================
+// Redis fixed-window implementation (async)
+// ============================================================
+
+/**
+ * Lua script: atomically increment the counter for `key` and set its
+ * TTL on first increment. Returns [count, ttlMs] where ttlMs is the
+ * remaining window in milliseconds.
+ */
+const RATE_LIMIT_LUA = `
+local key    = KEYS[1]
+local limit  = tonumber(ARGV[1])
+local window = tonumber(ARGV[2])   -- milliseconds
+
+local count = redis.call('INCR', key)
+if count == 1 then
+  redis.call('PEXPIRE', key, window)
+end
+
+local ttl = redis.call('PTTL', key)
+return { count, ttl }
+`
+
+/**
+ * Redis-backed fixed-window rate check. Returns a RateLimitResult
+ * just like the in-memory version but works across multiple processes.
+ */
+export async function checkRateLimitRedis(
+  key: string,
+  { limit, windowMs }: RateLimitOptions,
+): Promise<RateLimitResult> {
+  try {
+    const client = getRedis()
+    const result = (await client.eval(
+      RATE_LIMIT_LUA,
+      1,
+      `rl:${key}`,
+      limit,
+      windowMs,
+    )) as [number, number]
+    const [count, ttlMs] = result
+    const now = Date.now()
+    const reset = now + Math.max(ttlMs, 0)
+    const remaining = Math.max(0, limit - count)
+    return { success: count <= limit, remaining, reset, limit }
+  } catch (err) {
+    // Redis error: fail open (allow) so the app keeps working.
+    console.error('[rate-limit] Redis error, failing open:', (err as Error).message)
+    return { success: true, remaining: limit - 1, reset: Date.now() + windowMs, limit }
+  }
+}
+
+// ============================================================
+// In-memory fixed-window implementation (sync, single-process)
+// ============================================================
+
 const buckets = new Map<string, Entry>();
 
 // Opportunistic cleanup. Running a sweep on every call would be
@@ -57,7 +110,7 @@ function sweepExpired(now: number) {
   }
 }
 
-export function checkRateLimit(
+function checkRateLimitMemory(
   key: string,
   { limit, windowMs }: RateLimitOptions,
 ): RateLimitResult {
@@ -87,6 +140,28 @@ export function checkRateLimit(
     reset: entry.resetAt,
     limit,
   };
+}
+
+// ============================================================
+// Unified export — Redis when available, in-memory otherwise.
+// ============================================================
+
+/**
+ * Check rate limit for `key`. Automatically uses Redis when REDIS_URL
+ * is set, otherwise falls back to the in-memory store.
+ *
+ * NOTE: When Redis is active this function is **async**. When using
+ * the in-memory fallback it still returns a Promise so call sites are
+ * identical regardless of backend.
+ */
+export async function checkRateLimit(
+  key: string,
+  opts: RateLimitOptions,
+): Promise<RateLimitResult> {
+  if (redisEnabled) {
+    return checkRateLimitRedis(key, opts)
+  }
+  return checkRateLimitMemory(key, opts)
 }
 
 /**

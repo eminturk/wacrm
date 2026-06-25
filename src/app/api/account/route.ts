@@ -12,12 +12,14 @@
 // ============================================================
 
 import { NextResponse } from "next/server";
+import { eq } from "drizzle-orm";
 
 import {
   requireRole,
   getCurrentAccount,
   toErrorResponse,
 } from "@/lib/auth/account";
+import { accounts } from "@/lib/db/schema";
 import {
   checkRateLimit,
   rateLimitResponse,
@@ -46,7 +48,7 @@ export async function PATCH(request: Request) {
     // abuse (script run in a loop) and a compromised admin session
     // spamming renames. Each admin endpoint keys its own bucket so
     // one route doesn't starve another.
-    const limit = checkRateLimit(
+    const limit = await checkRateLimit(
       `admin:rename:${ctx.userId}`,
       RATE_LIMITS.adminAction,
     );
@@ -78,17 +80,17 @@ export async function PATCH(request: Request) {
       );
     }
 
-    // RLS allows this UPDATE because accounts_update requires
-    // `is_account_member(id, 'admin')`, and requireRole already
-    // guaranteed the caller is admin+.
-    const { data, error } = await ctx.supabase
-      .from("accounts")
-      .update({ name })
-      .eq("id", ctx.accountId)
-      .select("id, name")
-      .single();
-
-    if (error) {
+    // requireRole already guaranteed the caller is admin+; scope the
+    // update to their account.
+    let updated;
+    try {
+      const rows = await ctx.db
+        .update(accounts)
+        .set({ name })
+        .where(eq(accounts.id, ctx.accountId))
+        .returning({ id: accounts.id, name: accounts.name });
+      updated = rows[0];
+    } catch (error) {
       console.error("[PATCH /api/account] update error:", error);
       return NextResponse.json(
         { error: "Failed to update account" },
@@ -96,7 +98,7 @@ export async function PATCH(request: Request) {
       );
     }
 
-    return NextResponse.json({ account: data });
+    return NextResponse.json({ account: updated });
   } catch (err) {
     return toErrorResponse(err);
   }

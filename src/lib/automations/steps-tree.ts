@@ -1,4 +1,6 @@
-import { supabaseAdmin } from './admin-client'
+import { asc, eq } from 'drizzle-orm'
+import { db } from './admin-client'
+import { automationSteps } from '@/lib/db/schema'
 
 // ------------------------------------------------------------
 // Builder payload → flat rows for automation_steps.
@@ -37,12 +39,11 @@ export async function replaceSteps(
   automationId: string,
   input: BuilderStepInput[],
 ): Promise<string | null> {
-  const admin = supabaseAdmin()
-  const { error: delErr } = await admin
-    .from('automation_steps')
-    .delete()
-    .eq('automation_id', automationId)
-  if (delErr) return delErr.message
+  try {
+    await db.delete(automationSteps).where(eq(automationSteps.automationId, automationId))
+  } catch (err) {
+    return err instanceof Error ? err.message : String(err)
+  }
   return insertSteps(automationId, input)
 }
 
@@ -83,8 +84,22 @@ export async function insertSteps(
   walk(tree, null, null)
 
   if (rows.length === 0) return null
-  const { error } = await supabaseAdmin().from('automation_steps').insert(rows)
-  return error?.message ?? null
+  try {
+    await db.insert(automationSteps).values(
+      rows.map((row) => ({
+        id: row.id,
+        automationId: row.automation_id,
+        parentStepId: row.parent_step_id,
+        branch: row.branch,
+        stepType: row.step_type,
+        stepConfig: row.step_config,
+        position: row.position,
+      })),
+    )
+    return null
+  } catch (err) {
+    return err instanceof Error ? err.message : String(err)
+  }
 }
 
 function seedsToTree(seeds: BuilderStepInput[]): BuilderStepInput[] {
@@ -126,14 +141,23 @@ interface DbStep {
 }
 
 export async function loadStepsTree(automationId: string): Promise<BuilderStepNode[]> {
-  const { data, error } = await supabaseAdmin()
-    .from('automation_steps')
-    .select('*')
-    .eq('automation_id', automationId)
-    .order('position', { ascending: true })
-
-  if (error) throw new Error(error.message)
-  const rows = (data ?? []) as DbStep[]
+  let rows: DbStep[]
+  try {
+    rows = (await db
+      .select({
+        id: automationSteps.id,
+        parent_step_id: automationSteps.parentStepId,
+        branch: automationSteps.branch,
+        step_type: automationSteps.stepType,
+        step_config: automationSteps.stepConfig,
+        position: automationSteps.position,
+      })
+      .from(automationSteps)
+      .where(eq(automationSteps.automationId, automationId))
+      .orderBy(asc(automationSteps.position))) as unknown as DbStep[]
+  } catch (err) {
+    throw new Error(err instanceof Error ? err.message : String(err))
+  }
 
   const byId = new Map<string, BuilderStepNode>()
   for (const row of rows) {

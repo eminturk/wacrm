@@ -1,73 +1,84 @@
 import { NextResponse } from 'next/server'
-import { createClient } from '@/lib/supabase/server'
-import { supabaseAdmin } from '@/lib/flows/admin-client'
+import { and, asc, eq } from 'drizzle-orm'
+import { getSession } from '@/lib/auth/session'
+import { db } from '@/lib/db'
+import { flowNodes, flows } from '@/lib/db/schema'
 
-/**
- * GET   /api/flows/[id]  — fetch one flow with its nodes.
- * PUT   /api/flows/[id]  — replace name/trigger/entry/fallback + the
- *                          full node graph (delete-then-insert under
- *                          the hood; not atomic, but the runner is
- *                          resilient to mid-edit reads — node_not_found
- *                          gracefully ends the run).
- * DELETE /api/flows/[id] — hard delete (RLS+CASCADE clean up nodes,
- *                          runs, events).
- *
- * All three require a signed-in caller who owns the flow. Flows is in
- * soft-GA — the beta gate that previously 404'd non-beta accounts is
- * gone; the "Beta" label in the UI is the only remaining signal.
- */
+const flowSelect = {
+  id: flows.id,
+  user_id: flows.userId,
+  account_id: flows.accountId,
+  name: flows.name,
+  description: flows.description,
+  status: flows.status,
+  trigger_type: flows.triggerType,
+  trigger_config: flows.triggerConfig,
+  entry_node_id: flows.entryNodeId,
+  fallback_policy: flows.fallbackPolicy,
+  execution_count: flows.executionCount,
+  last_executed_at: flows.lastExecutedAt,
+  created_at: flows.createdAt,
+  updated_at: flows.updatedAt,
+}
+
+const nodeSelect = {
+  id: flowNodes.id,
+  flow_id: flowNodes.flowId,
+  node_key: flowNodes.nodeKey,
+  node_type: flowNodes.nodeType,
+  config: flowNodes.config,
+  position_x: flowNodes.positionX,
+  position_y: flowNodes.positionY,
+  created_at: flowNodes.createdAt,
+}
 
 async function requireOwnership(
   flowId: string,
 ): Promise<
-  | {
-      ok: true
-      userId: string
-      supabase: Awaited<ReturnType<typeof createClient>>
-    }
+  | { ok: true; userId: string }
   | { ok: false; status: number; body: { error: string } }
 > {
-  const supabase = await createClient()
-  const {
-    data: { user },
-  } = await supabase.auth.getUser()
+  const user = await getSession()
   if (!user) {
     return { ok: false, status: 401, body: { error: 'Unauthorized' } }
   }
-  // RLS scopes this to the caller — a flow owned by another user
-  // returns null (404 below).
-  const { data: flow } = await supabase
-    .from('flows')
-    .select('id')
-    .eq('id', flowId)
-    .maybeSingle()
+  const [flow] = await db
+    .select({ id: flows.id })
+    .from(flows)
+    .where(and(eq(flows.id, flowId), eq(flows.userId, user.id)))
+    .limit(1)
   if (!flow) {
     return { ok: false, status: 404, body: { error: 'Not found' } }
   }
-  return { ok: true, userId: user.id, supabase }
+  return { ok: true, userId: user.id }
 }
 
 export async function GET(
   _request: Request,
   context: { params: Promise<{ id: string }> },
 ) {
-  const { id } = await context.params
-  const guard = await requireOwnership(id)
-  if (!guard.ok) return NextResponse.json(guard.body, { status: guard.status })
-  const { supabase } = guard
+  try {
+    const { id } = await context.params
+    const guard = await requireOwnership(id)
+    if (!guard.ok) return NextResponse.json(guard.body, { status: guard.status })
 
-  const [{ data: flow }, { data: nodes }] = await Promise.all([
-    supabase.from('flows').select('*').eq('id', id).maybeSingle(),
-    supabase
-      .from('flow_nodes')
-      .select('*')
-      .eq('flow_id', id)
-      .order('created_at', { ascending: true }),
-  ])
-  if (!flow) {
-    return NextResponse.json({ error: 'Not found' }, { status: 404 })
+    const [flowRows, nodes] = await Promise.all([
+      db.select(flowSelect).from(flows).where(eq(flows.id, id)).limit(1),
+      db
+        .select(nodeSelect)
+        .from(flowNodes)
+        .where(eq(flowNodes.flowId, id))
+        .orderBy(asc(flowNodes.createdAt)),
+    ])
+    const flow = flowRows[0]
+    if (!flow) {
+      return NextResponse.json({ error: 'Not found' }, { status: 404 })
+    }
+    return NextResponse.json({ flow, nodes })
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Internal server error'
+    return NextResponse.json({ error: message }, { status: 500 })
   }
-  return NextResponse.json({ flow, nodes: nodes ?? [] })
 }
 
 interface PutBody {
@@ -90,105 +101,82 @@ export async function PUT(
   request: Request,
   context: { params: Promise<{ id: string }> },
 ) {
-  const { id } = await context.params
-  const guard = await requireOwnership(id)
-  if (!guard.ok) return NextResponse.json(guard.body, { status: guard.status })
+  try {
+    const { id } = await context.params
+    const guard = await requireOwnership(id)
+    if (!guard.ok) return NextResponse.json(guard.body, { status: guard.status })
 
-  const body = (await request.json().catch(() => null)) as PutBody | null
-  if (!body) {
-    return NextResponse.json({ error: 'Invalid JSON' }, { status: 400 })
-  }
-  if (body.name !== undefined && !body.name.trim()) {
-    return NextResponse.json(
-      { error: 'name cannot be empty' },
-      { status: 400 },
-    )
-  }
-
-  const admin = supabaseAdmin()
-
-  // Update the flow row first — the body may not include `nodes` (a
-  // header-only save for editing the trigger config without touching
-  // the graph). Skip node replacement in that case.
-  const flowPatch: Record<string, unknown> = {
-    updated_at: new Date().toISOString(),
-  }
-  if (body.name !== undefined) flowPatch.name = body.name.trim()
-  if (body.description !== undefined)
-    flowPatch.description = body.description
-  if (body.trigger_type !== undefined) flowPatch.trigger_type = body.trigger_type
-  if (body.trigger_config !== undefined)
-    flowPatch.trigger_config = body.trigger_config
-  if (body.entry_node_id !== undefined)
-    flowPatch.entry_node_id = body.entry_node_id
-  if (body.fallback_policy !== undefined)
-    flowPatch.fallback_policy = body.fallback_policy
-
-  const { error: updErr } = await admin
-    .from('flows')
-    .update(flowPatch)
-    .eq('id', id)
-  if (updErr) {
-    return NextResponse.json({ error: updErr.message }, { status: 500 })
-  }
-
-  if (body.nodes !== undefined) {
-    // Delete-then-insert. Not transactional but the runner handles
-    // mid-edit reads safely (a node_not_found ends the run cleanly).
-    const { error: delErr } = await admin
-      .from('flow_nodes')
-      .delete()
-      .eq('flow_id', id)
-    if (delErr) {
-      return NextResponse.json({ error: delErr.message }, { status: 500 })
+    const body = (await request.json().catch(() => null)) as PutBody | null
+    if (!body) {
+      return NextResponse.json({ error: 'Invalid JSON' }, { status: 400 })
     }
-    if (body.nodes.length > 0) {
-      const { error: insErr } = await admin.from('flow_nodes').insert(
-        body.nodes.map((n) => ({
-          flow_id: id,
-          node_key: n.node_key,
-          node_type: n.node_type,
-          config: n.config,
-          position_x: n.position_x ?? 0,
-          position_y: n.position_y ?? 0,
-        })),
+    if (body.name !== undefined && !body.name.trim()) {
+      return NextResponse.json(
+        { error: 'name cannot be empty' },
+        { status: 400 },
       )
-      if (insErr) {
-        return NextResponse.json({ error: insErr.message }, { status: 500 })
+    }
+
+    const flowPatch: Partial<typeof flows.$inferInsert> = {
+      updatedAt: new Date(),
+    }
+    if (body.name !== undefined) flowPatch.name = body.name.trim()
+    if (body.description !== undefined)
+      flowPatch.description = body.description
+    if (body.trigger_type !== undefined) flowPatch.triggerType = body.trigger_type
+    if (body.trigger_config !== undefined)
+      flowPatch.triggerConfig = body.trigger_config
+    if (body.entry_node_id !== undefined)
+      flowPatch.entryNodeId = body.entry_node_id
+    if (body.fallback_policy !== undefined)
+      flowPatch.fallbackPolicy = body.fallback_policy
+
+    await db.update(flows).set(flowPatch).where(eq(flows.id, id))
+
+    if (body.nodes !== undefined) {
+      await db.delete(flowNodes).where(eq(flowNodes.flowId, id))
+      if (body.nodes.length > 0) {
+        await db.insert(flowNodes).values(
+          body.nodes.map((n) => ({
+            flowId: id,
+            nodeKey: n.node_key,
+            nodeType: n.node_type,
+            config: n.config,
+            positionX: n.position_x ?? 0,
+            positionY: n.position_y ?? 0,
+          })),
+        )
       }
     }
-  }
 
-  // Re-fetch and return the new state — the editor uses the response
-  // to reconcile its local form state.
-  const [{ data: flow }, { data: nodes }] = await Promise.all([
-    admin.from('flows').select('*').eq('id', id).maybeSingle(),
-    admin
-      .from('flow_nodes')
-      .select('*')
-      .eq('flow_id', id)
-      .order('created_at', { ascending: true }),
-  ])
-  return NextResponse.json({ flow, nodes: nodes ?? [] })
+    const [flowRows, nodes] = await Promise.all([
+      db.select(flowSelect).from(flows).where(eq(flows.id, id)).limit(1),
+      db
+        .select(nodeSelect)
+        .from(flowNodes)
+        .where(eq(flowNodes.flowId, id))
+        .orderBy(asc(flowNodes.createdAt)),
+    ])
+    return NextResponse.json({ flow: flowRows[0], nodes })
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Internal server error'
+    return NextResponse.json({ error: message }, { status: 500 })
+  }
 }
 
 export async function DELETE(
   _request: Request,
   context: { params: Promise<{ id: string }> },
 ) {
-  const { id } = await context.params
-  const guard = await requireOwnership(id)
-  if (!guard.ok) return NextResponse.json(guard.body, { status: guard.status })
+  try {
+    const { id } = await context.params
+    const guard = await requireOwnership(id)
+    if (!guard.ok) return NextResponse.json(guard.body, { status: guard.status })
 
-  // CASCADE on flow_nodes / flow_runs / flow_run_events handles the
-  // children. Active runs end abruptly — there's no graceful "drain"
-  // mechanism in v1, but that's intentional: deleting a flow is a
-  // deliberate destructive action and the partial unique index will
-  // free up the contact for new triggers immediately.
-  const { error } = await supabaseAdmin().from('flows').delete().eq('id', id)
-  if (error) {
-    return NextResponse.json({ error: error.message }, { status: 500 })
+    await db.delete(flows).where(eq(flows.id, id))
+    return NextResponse.json({ ok: true })
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Internal server error'
+    return NextResponse.json({ error: message }, { status: 500 })
   }
-  return NextResponse.json({ ok: true })
 }
-

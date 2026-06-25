@@ -18,8 +18,10 @@
 // ============================================================
 
 import { NextResponse } from "next/server";
+import { and, desc, eq, gt, isNull } from "drizzle-orm";
 
 import { requireRole, toErrorResponse } from "@/lib/auth/account";
+import { accountInvitations } from "@/lib/db/schema";
 import {
   clampExpiryDays,
   generateInviteToken,
@@ -140,25 +142,29 @@ export async function GET() {
   try {
     const ctx = await requireRole("admin");
 
-    const { data, error } = await ctx.supabase
-      .from("account_invitations")
-      .select(
-        "id, role, label, created_by_user_id, created_at, expires_at, accepted_at, accepted_by_user_id",
+    const data = await ctx.db
+      .select({
+        id: accountInvitations.id,
+        account_id: accountInvitations.accountId,
+        role: accountInvitations.role,
+        label: accountInvitations.label,
+        created_by_user_id: accountInvitations.createdByUserId,
+        created_at: accountInvitations.createdAt,
+        expires_at: accountInvitations.expiresAt,
+        accepted_at: accountInvitations.acceptedAt,
+        accepted_by_user_id: accountInvitations.acceptedByUserId,
+      })
+      .from(accountInvitations)
+      .where(
+        and(
+          eq(accountInvitations.accountId, ctx.accountId),
+          isNull(accountInvitations.acceptedAt),
+          gt(accountInvitations.expiresAt, new Date()),
+        ),
       )
-      .eq("account_id", ctx.accountId)
-      .is("accepted_at", null)
-      .gt("expires_at", new Date().toISOString())
-      .order("created_at", { ascending: false });
+      .orderBy(desc(accountInvitations.createdAt));
 
-    if (error) {
-      console.error("[GET /api/account/invitations] fetch error:", error);
-      return NextResponse.json(
-        { error: "Failed to load invitations" },
-        { status: 500 },
-      );
-    }
-
-    return NextResponse.json({ invitations: data ?? [] });
+    return NextResponse.json({ invitations: data });
   } catch (err) {
     return toErrorResponse(err);
   }
@@ -172,7 +178,7 @@ export async function POST(request: Request) {
     // legitimate admin is far below this; the cap exists to keep
     // a script run in a loop or a compromised admin session from
     // flooding `account_invitations` with rows.
-    const limit = checkRateLimit(
+    const limit = await checkRateLimit(
       `admin:inviteCreate:${ctx.userId}`,
       RATE_LIMITS.adminAction,
     );
@@ -216,25 +222,26 @@ export async function POST(request: Request) {
 
     const { token, hash } = generateInviteToken();
 
-    const { data, error } = await ctx.supabase
-      .from("account_invitations")
-      .insert({
-        account_id: ctx.accountId,
-        token_hash: hash,
+    const [data] = await ctx.db
+      .insert(accountInvitations)
+      .values({
+        accountId: ctx.accountId,
+        tokenHash: hash,
         role,
-        created_by_user_id: ctx.userId,
+        createdByUserId: ctx.userId,
         label,
-        expires_at: expiresAt.toISOString(),
+        expiresAt,
       })
-      .select("id, role, label, expires_at, created_at")
-      .single();
+      .returning({
+        id: accountInvitations.id,
+        role: accountInvitations.role,
+        label: accountInvitations.label,
+        expires_at: accountInvitations.expiresAt,
+        created_at: accountInvitations.createdAt,
+      });
 
-    if (error || !data) {
-      console.error("[POST /api/account/invitations] insert error:", error);
-      return NextResponse.json(
-        { error: "Failed to create invitation" },
-        { status: 500 },
-      );
+    if (!data) {
+      return NextResponse.json({ error: "Failed to create invitation" }, { status: 500 });
     }
 
     return NextResponse.json(

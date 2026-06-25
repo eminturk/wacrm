@@ -1,91 +1,88 @@
-import { createServerClient } from '@supabase/ssr'
 import { NextResponse, type NextRequest } from 'next/server'
 
-export async function middleware(request: NextRequest) {
-  let supabaseResponse = NextResponse.next({ request })
+const SESSION_COOKIE_NAME = 'wacrm_session'
 
-  const supabase = createServerClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
-    {
-      cookies: {
-        getAll() {
-          return request.cookies.getAll()
-        },
-        setAll(cookiesToSet) {
-          cookiesToSet.forEach(({ name, value, options }) => request.cookies.set(name, value))
-          supabaseResponse = NextResponse.next({ request })
-          cookiesToSet.forEach(({ name, value, options }) =>
-            supabaseResponse.cookies.set(name, value, options)
-          )
-        },
-      },
-    }
-  )
+/**
+ * Validate the session cookie against the database via the internal
+ * `/api/auth/me` route. Middleware runs on the Edge runtime where the
+ * Postgres driver isn't available, so we delegate the DB lookup to a
+ * Node route handler and forward the cookie. Returns true when the
+ * cookie maps to a live session.
+ */
+async function isAuthenticated(request: NextRequest): Promise<boolean> {
+  const token = request.cookies.get(SESSION_COOKIE_NAME)?.value
+  if (!token) return false
 
-  const { data: { user } } = await supabase.auth.getUser()
-
-  // getUser() transparently refreshes an expired access token, which
-  // ROTATES the refresh token and writes the new cookies onto
-  // `supabaseResponse` via setAll() above. Any response we return in
-  // place of `supabaseResponse` (every redirect / JSON branch below)
-  // is a fresh object that does NOT carry those Set-Cookie headers, so
-  // the rotated token never reaches the browser. The next request then
-  // replays the old, now-consumed refresh token, the refresh fails, and
-  // the session wedges — the user gets a broken reload after idling and
-  // can only recover by manually clearing cookies (issue #288). Copy the
-  // refreshed cookies onto whatever response we hand back to fix that.
-  const withRefreshedCookies = <T extends NextResponse>(response: T): T => {
-    supabaseResponse.cookies.getAll().forEach((cookie) => {
-      response.cookies.set(cookie)
+  try {
+    const res = await fetch(new URL('/api/auth/me', request.url), {
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${token}` },
+      // Don't cache — session state changes per request.
+      cache: 'no-store',
     })
-    return response
+    if (!res.ok) return false
+    const body = (await res.json()) as { user?: unknown }
+    return Boolean(body.user)
+  } catch {
+    // On a transient error, fail closed for protected routes (handled
+    // by the caller treating `false` as "not authenticated").
+    return false
   }
+}
 
-  // Auth pages - redirect to dashboard if already logged in.
-  // Exception: when an invite token is in the query string we
-  // send the already-signed-in user to /join/<token> instead so
-  // they can accept the invitation in one click. Without this,
-  // a forwarded invite link to someone who's already signed in
-  // would silently drop them on /dashboard.
-  if (user && (
-    request.nextUrl.pathname === '/login' ||
-    request.nextUrl.pathname === '/signup' ||
-    request.nextUrl.pathname === '/forgot-password'
-  )) {
+export async function middleware(request: NextRequest) {
+  const { pathname } = request.nextUrl
+
+  const authed = await isAuthenticated(request)
+
+  // Auth pages — redirect to dashboard (or the pending invite) if the
+  // visitor is already signed in.
+  if (
+    authed &&
+    (pathname === '/login' ||
+      pathname === '/signup' ||
+      pathname === '/forgot-password')
+  ) {
     const url = request.nextUrl.clone()
     const inviteToken = request.nextUrl.searchParams.get('invite')
-    if (
-      inviteToken &&
-      (request.nextUrl.pathname === '/login' ||
-        request.nextUrl.pathname === '/signup')
-    ) {
+    if (inviteToken && (pathname === '/login' || pathname === '/signup')) {
       url.pathname = `/join/${encodeURIComponent(inviteToken)}`
       url.search = ''
     } else {
       url.pathname = '/dashboard'
       url.search = ''
     }
-    return withRefreshedCookies(NextResponse.redirect(url))
+    return NextResponse.redirect(url)
   }
 
-  // Protected pages - redirect to login if not authenticated
-  const protectedPaths = ['/dashboard', '/inbox', '/contacts', '/pipelines', '/broadcasts', '/automations', '/settings']
-  if (!user && protectedPaths.some(path => request.nextUrl.pathname.startsWith(path))) {
+  // Protected pages — redirect to login if not authenticated.
+  const protectedPaths = [
+    '/dashboard',
+    '/inbox',
+    '/contacts',
+    '/pipelines',
+    '/broadcasts',
+    '/automations',
+    '/flows',
+    '/reports',
+    '/settings',
+  ]
+  if (!authed && protectedPaths.some((p) => pathname.startsWith(p))) {
     const url = request.nextUrl.clone()
     url.pathname = '/login'
-    return withRefreshedCookies(NextResponse.redirect(url))
+    url.search = ''
+    return NextResponse.redirect(url)
   }
 
-  // API routes that need auth (not webhooks)
-  if (!user && request.nextUrl.pathname.startsWith('/api/whatsapp/') &&
-      !request.nextUrl.pathname.includes('/webhook')) {
-    return withRefreshedCookies(
-      NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-    )
+  // Authenticated WhatsApp API routes (webhooks excluded).
+  if (
+    !authed &&
+    pathname.startsWith('/api/whatsapp/') &&
+    !pathname.includes('/webhook')
+  ) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
 
-  return supabaseResponse
+  return NextResponse.next()
 }
 
 export const config = {

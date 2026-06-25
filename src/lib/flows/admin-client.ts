@@ -1,16 +1,19 @@
-import { createClient, type SupabaseClient } from '@supabase/supabase-js'
+// ============================================================
+// Flows engine database handle.
+//
+// Migrated off Supabase: this used to return a service-role Supabase
+// client. It now re-exports the Drizzle admin handle. The function
+// name `supabaseAdmin` is preserved so existing call sites keep
+// working, but it returns the Drizzle `db` — callers MUST scope every
+// query by `account_id` (RLS has been removed).
+// ============================================================
 
-// Lazy, shared service-role client for the Flows engine.
-// Mirrors src/lib/automations/admin-client.ts — same shape so anyone
-// reading either file picks up the convention immediately.
-let _adminClient: SupabaseClient | null = null
+export { adminDb as db } from '@/lib/db/admin'
+export { sql, schema } from '@/lib/db/admin'
 
-export function supabaseAdmin(): SupabaseClient {
-  if (!_adminClient) {
-    _adminClient = createClient(
-      process.env.NEXT_PUBLIC_SUPABASE_URL!,
-      process.env.SUPABASE_SERVICE_ROLE_KEY!,
-    )
-  }
-  return _adminClient
+import { adminDb } from '@/lib/db/admin'
+
+/** @deprecated Returns the Drizzle admin handle. Prefer importing `db`. */
+export function supabaseAdmin() {
+  return adminDb
 }

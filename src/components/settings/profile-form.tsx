@@ -4,7 +4,6 @@ import { useEffect, useRef, useState } from 'react';
 import { toast } from 'sonner';
 import { Loader2, Upload, Trash2, Mail, CircleAlert } from 'lucide-react';
 
-import { createClient } from '@/lib/supabase/client';
 import { useAuth } from '@/hooks/use-auth';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -32,7 +31,6 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 export function ProfileForm() {
   const { user, profile, refreshProfile } = useAuth();
-  const supabase = createClient();
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const [fullName, setFullName] = useState('');
@@ -119,67 +117,45 @@ export function ProfileForm() {
         const ext =
           pendingAvatar.name.split('.').pop()?.toLowerCase() || 'png';
         const path = `${user.id}/avatar-${Date.now()}.${ext}`;
-        const { error: uploadError } = await supabase.storage
-          .from('avatars')
-          .upload(path, pendingAvatar, {
-            cacheControl: '3600',
-            upsert: true,
-            contentType: pendingAvatar.type,
-          });
-        if (uploadError) {
-          throw new Error(`Upload failed: ${uploadError.message}`);
+        const formData = new FormData();
+        formData.append('bucket', 'avatars');
+        formData.append('file', pendingAvatar, path);
+        const uploadRes = await fetch('/api/storage/upload', {
+          method: 'POST',
+          body: formData,
+        });
+        const uploadData = await uploadRes.json().catch(() => ({}));
+        if (!uploadRes.ok) {
+          throw new Error(`Upload failed: ${uploadData?.error || uploadRes.statusText}`);
         }
-        const {
-          data: { publicUrl },
-        } = supabase.storage.from('avatars').getPublicUrl(path);
-        nextAvatarUrl = publicUrl;
+        nextAvatarUrl = uploadData.publicUrl;
       } else if (removeAvatar) {
         nextAvatarUrl = null;
       }
 
-      // Persist name + avatar to profiles.
-      const { error: updateError } = await supabase
-        .from('profiles')
-        .update({
+      const emailChanged = trimmedEmail.toLowerCase() !== profile.email.toLowerCase();
+      const updateRes = await fetch('/api/settings/profile', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
           full_name: trimmedName,
-          avatar_url: nextAvatarUrl,
-        })
-        .eq('user_id', user.id);
-      if (updateError) {
-        throw new Error(`Save failed: ${updateError.message}`);
-      }
-
-      // Email change goes through Supabase Auth, which emails a
-      // confirmation to both the old and new addresses. We don't
-      // touch profiles.email — Supabase will push the change there
-      // after the user clicks the link (handled by the handle_new_user
-      // trigger pattern in production deployments).
-      let emailSent = false;
-      if (trimmedEmail.toLowerCase() !== profile.email.toLowerCase()) {
-        const { error: emailError } = await supabase.auth.updateUser({
           email: trimmedEmail,
-        });
-        if (emailError) {
-          // Partial success: name/avatar saved but email didn't.
-          toast.success('Profile saved');
-          toast.error(`Email change failed: ${emailError.message}`);
-          setSaving(false);
-          await refreshProfile();
-          return;
-        }
-        emailSent = true;
+          avatar_url: nextAvatarUrl,
+        }),
+      });
+      const updateData = await updateRes.json().catch(() => ({}));
+      if (!updateRes.ok) {
+        throw new Error(`Save failed: ${updateData?.error || updateRes.statusText}`);
       }
 
-      setEmailChangePending(emailSent);
+      setEmailChangePending(false);
       setPendingAvatar(null);
       setPreviewUrl(null);
       setRemoveAvatar(false);
       await refreshProfile();
 
       toast.success(
-        emailSent
-          ? 'Profile saved — check your email to confirm the address change'
-          : 'Profile saved',
+        emailChanged ? 'Profile saved — email updated' : 'Profile saved',
       );
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Unknown error';
@@ -196,13 +172,7 @@ export function ProfileForm() {
       pendingAvatar !== null ||
       removeAvatar);
 
-  const joined = user?.created_at
-    ? new Date(user.created_at).toLocaleDateString(undefined, {
-        year: 'numeric',
-        month: 'long',
-        day: 'numeric',
-      })
-    : '—';
+  const joined = '—';
 
   return (
     <section className="max-w-2xl animate-in fade-in-50 duration-200">

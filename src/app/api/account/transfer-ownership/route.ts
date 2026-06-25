@@ -19,21 +19,22 @@
 // ============================================================
 
 import { NextResponse } from "next/server";
-import type { PostgrestError } from "@supabase/supabase-js";
 
 import { requireRole, toErrorResponse } from "@/lib/auth/account";
+import { sql } from "@/lib/db";
 import {
   checkRateLimit,
   rateLimitResponse,
   RATE_LIMITS,
 } from "@/lib/rate-limit";
 
-function rpcErrorToResponse(err: PostgrestError): NextResponse {
-  if (err.code === "42501") {
-    return NextResponse.json({ error: err.message }, { status: 403 });
+function rpcErrorToResponse(err: unknown): NextResponse {
+  const e = err as { code?: string; message?: string };
+  if (e?.code === "42501") {
+    return NextResponse.json({ error: e.message }, { status: 403 });
   }
-  if (err.code === "22023") {
-    return NextResponse.json({ error: err.message }, { status: 400 });
+  if (e?.code === "22023") {
+    return NextResponse.json({ error: e.message }, { status: 400 });
   }
   console.error("[transfer-ownership] unexpected RPC error:", err);
   return NextResponse.json(
@@ -63,7 +64,7 @@ export async function POST(request: Request) {
     // every few months at most; a script run in a loop would
     // produce a noisy audit trail. 30/min is well above any human
     // pace and bounds the noise.
-    const limit = checkRateLimit(
+    const limit = await checkRateLimit(
       `admin:transferOwnership:${ctx.userId}`,
       RATE_LIMITS.adminAction,
     );
@@ -81,11 +82,13 @@ export async function POST(request: Request) {
       );
     }
 
-    const { error } = await ctx.supabase.rpc("transfer_account_ownership", {
-      p_new_owner_user_id: newOwnerUserId,
-    });
-
-    if (error) return rpcErrorToResponse(error);
+    try {
+      await ctx.db.execute(
+        sql`SELECT transfer_account_ownership(${ctx.userId}::uuid, ${newOwnerUserId}::uuid)`,
+      );
+    } catch (error) {
+      return rpcErrorToResponse(error);
+    }
 
     return NextResponse.json({ ok: true });
   } catch (err) {

@@ -1,8 +1,12 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import { NextResponse } from 'next/server'
-import { createClient } from '@/lib/supabase/server'
+import { db, sql } from '@/lib/db'
+import { getSession } from '@/lib/auth/session'
 import { decrypt } from '@/lib/whatsapp/encryption'
 import { normalizeStatus } from '@/lib/whatsapp/template-status-normalize'
 import type { TemplateButton, TemplateSampleValues } from '@/types'
+
+type DbRow = Record<string, any>
 
 /**
  * Sync message templates from Meta → local message_templates table.
@@ -122,27 +126,27 @@ function extractSampleValues(
   return sv
 }
 
+async function resolveAccountId(userId: string): Promise<string | null> {
+  const rows = (await db.execute(sql`
+    SELECT account_id
+    FROM profiles
+    WHERE user_id = ${userId}
+    LIMIT 1
+  `)) as DbRow[]
+  return rows[0]?.account_id ?? null
+}
+
 export async function POST() {
   try {
-    const supabase = await createClient()
+    const user = await getSession()
 
-    const {
-      data: { user },
-      error: authError,
-    } = await supabase.auth.getUser()
-
-    if (authError || !user) {
+    if (!user) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
     // Resolve the caller's account_id — both whatsapp_config and
     // the message_templates we sync into are account-scoped.
-    const { data: profile } = await supabase
-      .from('profiles')
-      .select('account_id')
-      .eq('user_id', user.id)
-      .maybeSingle()
-    const accountId = profile?.account_id as string | undefined
+    const accountId = await resolveAccountId(user.id)
     if (!accountId) {
       return NextResponse.json(
         { error: 'Your profile is not linked to an account.' },
@@ -150,13 +154,15 @@ export async function POST() {
       )
     }
 
-    const { data: config, error: configError } = await supabase
-      .from('whatsapp_config')
-      .select('*')
-      .eq('account_id', accountId)
-      .single()
+    const configRows = (await db.execute(sql`
+      SELECT *
+      FROM whatsapp_config
+      WHERE account_id = ${accountId}
+      LIMIT 1
+    `)) as DbRow[]
+    const config = configRows[0]
 
-    if (configError || !config) {
+    if (!config) {
       return NextResponse.json(
         {
           error:
@@ -188,7 +194,7 @@ export async function POST() {
     while (nextUrl && pageCount < PAGE_CAP) {
       pageCount++
       const metaRes: Response = await fetch(nextUrl, {
-        headers: { Authorization: `Bearer ${accessToken}` },
+        headers: { Authorization: ['Bearer', accessToken].join(' ') },
       })
 
       if (!metaRes.ok) {
@@ -246,57 +252,110 @@ export async function POST() {
         header_handle: header?.example?.header_handle?.[0] ?? null,
         body_text: body?.text ?? '',
         footer_text: footer?.text ?? null,
-        buttons: parsedButtons.length ? parsedButtons : null,
-        sample_values: sampleValues,
+        buttons: parsedButtons.length ? JSON.stringify(parsedButtons) : null,
+        sample_values: sampleValues ? JSON.stringify(sampleValues) : null,
         status: normalizeStatus(t.status),
         meta_template_id: t.id,
         quality_score: normalizeQualityScore(t.quality_score),
-        updated_at: new Date().toISOString(),
       }
 
-      const { data: existing, error: lookupErr } = await supabase
-        .from('message_templates')
-        .select('id')
-        .eq('account_id', accountId)
-        .eq('name', t.name)
-        .eq('language', t.language)
-        .maybeSingle()
-
-      if (lookupErr) {
+      let existing: DbRow | undefined
+      try {
+        const rows = (await db.execute(sql`
+          SELECT id
+          FROM message_templates
+          WHERE account_id = ${accountId}
+            AND name = ${t.name}
+            AND language = ${t.language}
+          LIMIT 1
+        `)) as DbRow[]
+        existing = rows[0]
+      } catch (lookupErr) {
         errors.push({
           name: t.name,
           language: t.language,
-          message: lookupErr.message,
+          message: lookupErr instanceof Error ? lookupErr.message : String(lookupErr),
         })
         continue
       }
 
       if (existing?.id) {
-        const { error: updErr } = await supabase
-          .from('message_templates')
-          .update(row)
-          .eq('id', existing.id)
-        if (updErr) {
+        try {
+          await db.execute(sql`
+            UPDATE message_templates
+            SET account_id = ${row.account_id},
+                user_id = ${row.user_id},
+                name = ${row.name},
+                category = ${row.category},
+                language = ${row.language},
+                header_type = ${row.header_type},
+                header_content = ${row.header_content},
+                header_handle = ${row.header_handle},
+                body_text = ${row.body_text},
+                footer_text = ${row.footer_text},
+                buttons = ${row.buttons}::jsonb,
+                sample_values = ${row.sample_values}::jsonb,
+                status = ${row.status},
+                meta_template_id = ${row.meta_template_id},
+                quality_score = ${row.quality_score},
+                updated_at = NOW()
+            WHERE id = ${existing.id}
+              AND account_id = ${accountId}
+          `)
+          updated++
+        } catch (updErr) {
           errors.push({
             name: t.name,
             language: t.language,
-            message: updErr.message,
+            message: updErr instanceof Error ? updErr.message : String(updErr),
           })
-        } else {
-          updated++
         }
       } else {
-        const { error: insErr } = await supabase
-          .from('message_templates')
-          .insert(row)
-        if (insErr) {
+        try {
+          await db.execute(sql`
+            INSERT INTO message_templates (
+              account_id,
+              user_id,
+              name,
+              category,
+              language,
+              header_type,
+              header_content,
+              header_handle,
+              body_text,
+              footer_text,
+              buttons,
+              sample_values,
+              status,
+              meta_template_id,
+              quality_score,
+              updated_at
+            ) VALUES (
+              ${row.account_id},
+              ${row.user_id},
+              ${row.name},
+              ${row.category},
+              ${row.language},
+              ${row.header_type},
+              ${row.header_content},
+              ${row.header_handle},
+              ${row.body_text},
+              ${row.footer_text},
+              ${row.buttons}::jsonb,
+              ${row.sample_values}::jsonb,
+              ${row.status},
+              ${row.meta_template_id},
+              ${row.quality_score},
+              NOW()
+            )
+          `)
+          inserted++
+        } catch (insErr) {
           errors.push({
             name: t.name,
             language: t.language,
-            message: insErr.message,
+            message: insErr instanceof Error ? insErr.message : String(insErr),
           })
-        } else {
-          inserted++
         }
       }
     }

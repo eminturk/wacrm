@@ -3,39 +3,33 @@
 // components. Reads the caller's profile + account in one round
 // trip and verifies role on demand.
 //
-// IMPORTANT: this module is server-only. It imports the Supabase
-// SSR client (`@/lib/supabase/server`), which reads `next/headers`
-// cookies. Importing it from a client component will fail at
-// build time with the standard Next.js "You're importing a
-// component that needs `next/headers`" error — that's the
-// boundary check; we don't need the `server-only` package.
+// IMPORTANT: this module is server-only. It imports the session
+// helper (`@/lib/auth/session`), which reads `next/headers` cookies.
+// Importing it from a client component will fail at build time.
 //
 // Calling convention
 // ------------------
-// API routes don't need to redo `supabase.auth.getUser()` — they
-// receive a fully-loaded context from `requireRole`:
-//
 //   try {
 //     const ctx = await requireRole("admin");
-//     // ctx.supabase — the SSR client (RLS scoped to this user)
-//     // ctx.userId  — auth.uid()
+//     // ctx.db       — the Drizzle handle
+//     // ctx.userId   — the caller's user id
 //     // ctx.accountId / ctx.role / ctx.account
 //   } catch (err) {
-//     return errorResponse(err); // see toErrorResponse() below
+//     return toErrorResponse(err);
 //   }
 // ============================================================
 
 import { NextResponse } from "next/server";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import { eq } from "drizzle-orm";
+import { headers } from "next/headers";
 
-import { createClient } from "@/lib/supabase/server";
+import { db } from "@/lib/db";
+import { profiles, accounts } from "@/lib/db/schema";
+import { getSession } from "@/lib/auth/session";
 import { hasMinRole, isAccountRole, type AccountRole } from "./roles";
 
 // ------------------------------------------------------------
 // Errors
-//
-// Custom classes so API routes can map a single `catch` to the
-// right HTTP status without sprinkling 401/403 strings everywhere.
 // ------------------------------------------------------------
 
 export class UnauthorizedError extends Error {
@@ -56,15 +50,8 @@ export class ForbiddenError extends Error {
 
 /**
  * Convert one of the typed errors above (or anything else) into a
- * `NextResponse`. Routes can do:
- *
- *   } catch (err) {
- *     return toErrorResponse(err);
- *   }
- *
- * Unknown errors collapse to 500 with the generic message — we
- * never leak `err.message` for non-classified errors to keep
- * server internals out of the wire.
+ * `NextResponse`. Unknown errors collapse to 500 with the generic
+ * message — we never leak `err.message` for non-classified errors.
  */
 export function toErrorResponse(err: unknown): NextResponse {
   if (err instanceof UnauthorizedError || err instanceof ForbiddenError) {
@@ -75,13 +62,65 @@ export function toErrorResponse(err: unknown): NextResponse {
 }
 
 // ------------------------------------------------------------
+// IP allowlist helpers
+// ------------------------------------------------------------
+
+/**
+ * Return the client IP from Next.js request headers (server context).
+ * Prefers X-Forwarded-For (set by reverse proxies / CDNs).
+ */
+async function resolveClientIp(): Promise<string | null> {
+  try {
+    const hdrs = await headers();
+    const xff = hdrs.get("x-forwarded-for");
+    if (xff) return xff.split(",")[0].trim();
+    return hdrs.get("x-real-ip");
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Tiny CIDR match that handles IPv4 /prefix notation and plain IPs.
+ * We intentionally keep this dependency-free; the spec only requires
+ * per-account IP whitelisting, not full CIDR routing.
+ */
+function ipMatchesCidr(ip: string, cidr: string): boolean {
+  if (!cidr.includes("/")) {
+    return ip === cidr;
+  }
+  const [network, prefixStr] = cidr.split("/");
+  const prefix = parseInt(prefixStr, 10);
+  if (isNaN(prefix)) return false;
+  const ipParts = ip.split(".").map(Number);
+  const netParts = network.split(".").map(Number);
+  if (ipParts.length !== 4 || netParts.length !== 4) return false;
+  const mask = ~((1 << (32 - prefix)) - 1) >>> 0;
+  const ipNum =
+    ((ipParts[0] << 24) | (ipParts[1] << 16) | (ipParts[2] << 8) | ipParts[3]) >>> 0;
+  const netNum =
+    ((netParts[0] << 24) | (netParts[1] << 16) | (netParts[2] << 8) | netParts[3]) >>> 0;
+  return (ipNum & mask) === (netNum & mask);
+}
+
+/**
+ * Check whether `ip` is permitted by the account's `ip_allowlist`.
+ * An empty list means "allow all". Returns true when allowed.
+ */
+export function isIpAllowed(ip: string | null, allowlist: string[]): boolean {
+  if (!allowlist || allowlist.length === 0) return true; // open
+  if (!ip) return false; // can't verify; deny by default
+  return allowlist.some((entry) => ipMatchesCidr(ip, entry.trim()));
+}
+
+// ------------------------------------------------------------
 // Account context
 // ------------------------------------------------------------
 
 export interface AccountContext {
-  /** Supabase SSR client, RLS scoped to the calling user. */
-  supabase: SupabaseClient;
-  /** `auth.uid()` for the caller. Always defined when this resolves. */
+  /** Drizzle database handle. Scope every query by `accountId`. */
+  db: typeof db;
+  /** The caller's user id. Always defined when this resolves. */
   userId: string;
   /** Caller's account_id from their profile row. */
   accountId: string;
@@ -94,73 +133,58 @@ export interface AccountContext {
 /**
  * Resolve the caller's user + account + role in one round trip.
  *
- * Throws `UnauthorizedError` if there's no Supabase session.
- * Throws `ForbiddenError` if the profile is missing account
- * fields (shouldn't happen post-017 migration; defensive guard
- * against profile rows that pre-date the backfill or were
- * inserted by hand).
- *
- * Use `requireRole(min)` instead when the route also needs a
- * minimum-role check — it's a thin wrapper over this.
+ * Throws `UnauthorizedError` if there's no valid session.
+ * Throws `ForbiddenError` if the profile is missing account fields,
+ *   or if the account has an IP allowlist and the caller's IP is not
+ *   in it ("IP kısıtlaması").
  */
 export async function getCurrentAccount(): Promise<AccountContext> {
-  const supabase = await createClient();
-
-  const {
-    data: { user },
-    error: userErr,
-  } = await supabase.auth.getUser();
-  if (userErr || !user) {
+  const sessionUser = await getSession();
+  if (!sessionUser) {
     throw new UnauthorizedError();
   }
 
-  // Selecting through the FK gives us the account name in one
-  // query — `account:accounts!inner(id,name)` is Supabase's
-  // explicit-join syntax. `!inner` so a NULL account_id (which
-  // shouldn't exist) yields no row and trips the guard below
-  // rather than silently returning a half-populated profile.
-  const { data, error } = await supabase
-    .from("profiles")
-    .select("account_id, account_role, account:accounts!inner(id, name)")
-    .eq("user_id", user.id)
-    .maybeSingle();
+  const rows = await db
+    .select({
+      accountId: profiles.accountId,
+      accountRole: profiles.accountRole,
+      accountIdJoined: accounts.id,
+      accountName: accounts.name,
+      ipAllowlist: accounts.ipAllowlist,
+    })
+    .from(profiles)
+    .innerJoin(accounts, eq(profiles.accountId, accounts.id))
+    .where(eq(profiles.userId, sessionUser.id))
+    .limit(1);
 
-  if (error) {
-    console.error("[getCurrentAccount] profile fetch error:", error);
-    throw new ForbiddenError("Could not load account context");
-  }
-  if (!data || !data.account_id || !data.account_role || !data.account) {
-    // Pre-migration profile, or a manual insert that skipped the
-    // signup trigger. The user is authenticated but the app has
-    // no way to scope their queries — treat as forbidden.
+  const data = rows[0];
+  if (!data || !data.accountId || !data.accountRole) {
     throw new ForbiddenError("Profile is not linked to an account");
   }
-  if (!isAccountRole(data.account_role)) {
-    // The DB enum should make this impossible, but a future
-    // migration that broadens the enum without updating TS would
-    // hit this — surface it rather than silently widening.
-    throw new ForbiddenError(`Unknown account role: ${data.account_role}`);
+  if (!isAccountRole(data.accountRole)) {
+    throw new ForbiddenError(`Unknown account role: ${data.accountRole}`);
   }
 
-  // Supabase's typed client returns related rows as an array even
-  // for `!inner` single-record joins; normalise to a single object.
-  const accountRow = Array.isArray(data.account) ? data.account[0] : data.account;
+  // ---- IP allowlist enforcement ----
+  const allowlist = data.ipAllowlist ?? [];
+  if (allowlist.length > 0) {
+    const clientIp = await resolveClientIp();
+    if (!isIpAllowed(clientIp, allowlist)) {
+      throw new ForbiddenError("Access denied: your IP address is not in the allowlist");
+    }
+  }
 
   return {
-    supabase,
-    userId: user.id,
-    accountId: data.account_id,
-    role: data.account_role,
-    account: { id: accountRow.id, name: accountRow.name },
+    db,
+    userId: sessionUser.id,
+    accountId: data.accountId,
+    role: data.accountRole,
+    account: { id: data.accountIdJoined, name: data.accountName },
   };
 }
 
 /**
  * Resolve the caller's account context and enforce a minimum role.
- *
- * Throws `UnauthorizedError` / `ForbiddenError` as documented on
- * `getCurrentAccount`, plus `ForbiddenError("Insufficient role")`
- * when the caller is below `min`.
  */
 export async function requireRole(min: AccountRole): Promise<AccountContext> {
   const ctx = await getCurrentAccount();

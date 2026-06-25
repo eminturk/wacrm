@@ -15,9 +15,9 @@
 // ============================================================
 
 import { NextResponse } from "next/server";
-import type { PostgrestError } from "@supabase/supabase-js";
 
 import { requireRole, toErrorResponse } from "@/lib/auth/account";
+import { sql } from "@/lib/db";
 import { isAccountRole } from "@/lib/auth/roles";
 import {
   checkRateLimit,
@@ -25,15 +25,16 @@ import {
   RATE_LIMITS,
 } from "@/lib/rate-limit";
 
-// Map known SQLSTATEs from the RPCs (see migration 018) onto HTTP
-// statuses. The `error.code` field is the SQLSTATE; the `message`
-// is the human-readable RAISE message we put in the migration.
-function rpcErrorToResponse(err: PostgrestError): NextResponse {
-  if (err.code === "42501") {
-    return NextResponse.json({ error: err.message }, { status: 403 });
+// Map known SQLSTATEs raised by the RPCs (see migration 027) onto HTTP
+// statuses. The postgres-js driver throws errors carrying the SQLSTATE
+// on `.code` and the RAISE message on `.message`.
+function rpcErrorToResponse(err: unknown): NextResponse {
+  const e = err as { code?: string; message?: string };
+  if (e?.code === "42501") {
+    return NextResponse.json({ error: e.message }, { status: 403 });
   }
-  if (err.code === "22023") {
-    return NextResponse.json({ error: err.message }, { status: 400 });
+  if (e?.code === "22023") {
+    return NextResponse.json({ error: e.message }, { status: 400 });
   }
   console.error("[members route] unexpected RPC error:", err);
   return NextResponse.json(
@@ -49,7 +50,7 @@ export async function PATCH(
   try {
     const ctx = await requireRole("admin");
 
-    const limit = checkRateLimit(
+    const limit = await checkRateLimit(
       `admin:memberRole:${ctx.userId}`,
       RATE_LIMITS.adminAction,
     );
@@ -81,12 +82,13 @@ export async function PATCH(
       );
     }
 
-    const { error } = await ctx.supabase.rpc("set_member_role", {
-      p_user_id: userId,
-      p_new_role: role,
-    });
-
-    if (error) return rpcErrorToResponse(error);
+    try {
+      await ctx.db.execute(
+        sql`SELECT set_member_role(${ctx.userId}::uuid, ${userId}::uuid, ${role}::account_role_enum)`,
+      );
+    } catch (error) {
+      return rpcErrorToResponse(error);
+    }
 
     return NextResponse.json({ ok: true });
   } catch (err) {
@@ -101,7 +103,7 @@ export async function DELETE(
   try {
     const ctx = await requireRole("admin");
 
-    const limit = checkRateLimit(
+    const limit = await checkRateLimit(
       `admin:memberRemove:${ctx.userId}`,
       RATE_LIMITS.adminAction,
     );
@@ -109,13 +111,19 @@ export async function DELETE(
 
     const { userId } = await params;
 
-    const { data, error } = await ctx.supabase.rpc("remove_account_member", {
-      p_user_id: userId,
-    });
+    let newPersonalAccountId: unknown = null;
+    try {
+      const rows = await ctx.db.execute(
+        sql`SELECT remove_account_member(${ctx.userId}::uuid, ${userId}::uuid) AS new_account_id`,
+      );
+      newPersonalAccountId =
+        (rows as unknown as Array<{ new_account_id: string }>)[0]
+          ?.new_account_id ?? null;
+    } catch (error) {
+      return rpcErrorToResponse(error);
+    }
 
-    if (error) return rpcErrorToResponse(error);
-
-    return NextResponse.json({ ok: true, newPersonalAccountId: data });
+    return NextResponse.json({ ok: true, newPersonalAccountId });
   } catch (err) {
     return toErrorResponse(err);
   }

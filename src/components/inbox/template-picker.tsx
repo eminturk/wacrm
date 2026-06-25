@@ -1,7 +1,6 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { createClient } from "@/lib/supabase/client";
 import type { MessageTemplate } from "@/types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -91,32 +90,15 @@ export function TemplatePicker({
     let cancelled = false;
     (async () => {
       setLoading(true);
-      const supabase = createClient();
-      const {
-        data: { user },
-      } = await supabase.auth.getUser();
-
-      if (!user) {
-        if (!cancelled) {
-          setTemplates([]);
-          setLoading(false);
-        }
-        return;
-      }
-
-      const { data, error } = await supabase
-        .from("message_templates")
-        .select("*")
-        .eq("user_id", user.id)
-        .eq("status", "APPROVED")
-        .order("created_at", { ascending: false });
+      const res = await fetch("/api/templates?status=APPROVED");
+      const payload = await res.json().catch(() => ({}));
 
       if (cancelled) return;
-      if (error) {
-        console.error("Failed to fetch templates:", error);
+      if (!res.ok) {
+        console.error("Failed to fetch templates:", payload?.error || `HTTP ${res.status}`);
         setTemplates([]);
       } else {
-        setTemplates((data as MessageTemplate[]) ?? []);
+        setTemplates((payload.templates as MessageTemplate[]) ?? []);
       }
       setLoading(false);
     })();

@@ -1,5 +1,7 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import { NextResponse } from 'next/server';
-import { createClient } from '@/lib/supabase/server';
+import { db, sql } from '@/lib/db';
+import { getSession } from '@/lib/auth/session';
 import { sendReactionMessage } from '@/lib/whatsapp/meta-api';
 import { decrypt } from '@/lib/whatsapp/encryption';
 import { sanitizePhoneForMeta } from '@/lib/whatsapp/phone-utils';
@@ -8,6 +10,18 @@ import {
   rateLimitResponse,
   RATE_LIMITS,
 } from '@/lib/rate-limit';
+
+type DbRow = Record<string, any>;
+
+async function resolveAccountId(userId: string): Promise<string | null> {
+  const rows = (await db.execute(sql`
+    SELECT account_id
+    FROM profiles
+    WHERE user_id = ${userId}
+    LIMIT 1
+  `)) as DbRow[];
+  return rows[0]?.account_id ?? null;
+}
 
 /**
  * POST /api/whatsapp/react
@@ -20,30 +34,20 @@ import {
  */
 export async function POST(request: Request) {
   try {
-    const supabase = await createClient();
+    const user = await getSession();
 
-    const {
-      data: { user },
-      error: authError,
-    } = await supabase.auth.getUser();
-
-    if (authError || !user) {
+    if (!user) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
-    const limit = checkRateLimit(`react:${user.id}`, RATE_LIMITS.react);
+    const limit = await checkRateLimit(`react:${user.id}`, RATE_LIMITS.react);
     if (!limit.success) {
       return rateLimitResponse(limit);
     }
 
     // Resolve the caller's account_id so conversation + whatsapp_config
     // lookups work for teammates who didn't author the rows directly.
-    const { data: profile } = await supabase
-      .from('profiles')
-      .select('account_id')
-      .eq('user_id', user.id)
-      .maybeSingle();
-    const accountId = profile?.account_id as string | undefined;
+    const accountId = await resolveAccountId(user.id);
     if (!accountId) {
       return NextResponse.json(
         { error: 'Your profile is not linked to an account.' },
@@ -65,13 +69,17 @@ export async function POST(request: Request) {
     }
 
     // Resolve target message + its conversation; verify ownership.
-    const { data: targetMessage, error: msgError } = await supabase
-      .from('messages')
-      .select('id, message_id, conversation_id')
-      .eq('id', message_id)
-      .maybeSingle();
+    const targetRows = (await db.execute(sql`
+      SELECT m.id, m.message_id, m.conversation_id
+      FROM messages m
+      JOIN conversations c ON c.id = m.conversation_id
+      WHERE m.id = ${message_id}
+        AND c.account_id = ${accountId}
+      LIMIT 1
+    `)) as DbRow[];
+    const targetMessage = targetRows[0];
 
-    if (msgError || !targetMessage) {
+    if (!targetMessage) {
       return NextResponse.json({ error: 'Message not found' }, { status: 404 });
     }
 
@@ -84,14 +92,17 @@ export async function POST(request: Request) {
       );
     }
 
-    const { data: conversation, error: convError } = await supabase
-      .from('conversations')
-      .select('id, account_id, contact:contacts(phone)')
-      .eq('id', targetMessage.conversation_id)
-      .eq('account_id', accountId)
-      .maybeSingle();
+    const conversationRows = (await db.execute(sql`
+      SELECT c.id, c.account_id, row_to_json(ct.*) AS contact
+      FROM conversations c
+      JOIN contacts ct ON ct.id = c.contact_id
+      WHERE c.id = ${targetMessage.conversation_id}
+        AND c.account_id = ${accountId}
+      LIMIT 1
+    `)) as DbRow[];
+    const conversation = conversationRows[0];
 
-    if (convError || !conversation) {
+    if (!conversation) {
       return NextResponse.json(
         { error: 'Conversation not found' },
         { status: 404 },
@@ -109,13 +120,15 @@ export async function POST(request: Request) {
     }
 
     // WhatsApp config + access token. Account-scoped post-multi-user.
-    const { data: config, error: configError } = await supabase
-      .from('whatsapp_config')
-      .select('phone_number_id, access_token')
-      .eq('account_id', accountId)
-      .single();
+    const configRows = (await db.execute(sql`
+      SELECT phone_number_id, access_token
+      FROM whatsapp_config
+      WHERE account_id = ${accountId}
+      LIMIT 1
+    `)) as DbRow[];
+    const config = configRows[0];
 
-    if (configError || !config) {
+    if (!config) {
       return NextResponse.json(
         { error: 'WhatsApp not configured.' },
         { status: 400 },
@@ -145,15 +158,18 @@ export async function POST(request: Request) {
 
     // Mirror into DB. Empty emoji = removal.
     if (emoji === '') {
-      const { error: delError } = await supabase
-        .from('message_reactions')
-        .delete()
-        .eq('message_id', targetMessage.id)
-        .eq('actor_type', 'agent')
-        .eq('actor_id', user.id);
-
-      if (delError) {
-        console.error('[whatsapp/react] DB delete failed:', delError.message);
+      try {
+        await db.execute(sql`
+          DELETE FROM message_reactions
+          WHERE message_id = ${targetMessage.id}
+            AND actor_type = 'agent'
+            AND actor_id = ${user.id}
+        `);
+      } catch (delError) {
+        console.error(
+          '[whatsapp/react] DB delete failed:',
+          delError instanceof Error ? delError.message : delError,
+        );
         return NextResponse.json(
           { error: 'Reaction sent to Meta but DB delete failed' },
           { status: 500 },
@@ -162,19 +178,29 @@ export async function POST(request: Request) {
     } else {
       // Upsert. The unique constraint (message_id, actor_type, actor_id)
       // lets us swap emoji in a single statement.
-      const { error: upsertError } = await supabase.from('message_reactions').upsert(
-        {
-          message_id: targetMessage.id,
-          conversation_id: targetMessage.conversation_id,
-          actor_type: 'agent',
-          actor_id: user.id,
-          emoji,
-        },
-        { onConflict: 'message_id,actor_type,actor_id' },
-      );
-
-      if (upsertError) {
-        console.error('[whatsapp/react] DB upsert failed:', upsertError.message);
+      try {
+        await db.execute(sql`
+          INSERT INTO message_reactions (
+            message_id,
+            conversation_id,
+            actor_type,
+            actor_id,
+            emoji
+          ) VALUES (
+            ${targetMessage.id},
+            ${targetMessage.conversation_id},
+            'agent',
+            ${user.id},
+            ${emoji}
+          )
+          ON CONFLICT (message_id, actor_type, actor_id)
+          DO UPDATE SET emoji = EXCLUDED.emoji, created_at = NOW()
+        `);
+      } catch (upsertError) {
+        console.error(
+          '[whatsapp/react] DB upsert failed:',
+          upsertError instanceof Error ? upsertError.message : upsertError,
+        );
         return NextResponse.json(
           { error: 'Reaction sent to Meta but DB upsert failed' },
           { status: 500 },

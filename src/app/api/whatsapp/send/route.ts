@@ -1,5 +1,7 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import { NextResponse } from 'next/server'
-import { createClient } from '@/lib/supabase/server'
+import { db, sql } from '@/lib/db'
+import { getSession } from '@/lib/auth/session'
 import {
   sendTextMessage,
   sendTemplateMessage,
@@ -7,7 +9,6 @@ import {
   type MediaKind,
 } from '@/lib/whatsapp/meta-api'
 import { decrypt, encrypt, isLegacyFormat } from '@/lib/whatsapp/encryption'
-import { supabaseAdmin } from '@/lib/flows/admin-client'
 import {
   sanitizePhoneForMeta,
   isValidE164,
@@ -22,16 +23,23 @@ import {
 import type { MessageTemplate } from '@/types'
 import { isMessageTemplate } from '@/lib/whatsapp/template-row-guard'
 
+type DbRow = Record<string, any>
+
+async function resolveAccountId(userId: string): Promise<string | null> {
+  const rows = (await db.execute(sql`
+    SELECT account_id
+    FROM profiles
+    WHERE user_id = ${userId}
+    LIMIT 1
+  `)) as DbRow[]
+  return rows[0]?.account_id ?? null
+}
+
 export async function POST(request: Request) {
   try {
-    const supabase = await createClient()
+    const user = await getSession()
 
-    const {
-      data: { user },
-      error: authError,
-    } = await supabase.auth.getUser()
-
-    if (authError || !user) {
+    if (!user) {
       return NextResponse.json(
         { error: 'Unauthorized' },
         { status: 401 }
@@ -40,7 +48,7 @@ export async function POST(request: Request) {
 
     // Per-user rate limit. Bucket key is scoped to this route so
     // `/broadcast` has an independent budget.
-    const limit = checkRateLimit(`send:${user.id}`, RATE_LIMITS.send)
+    const limit = await checkRateLimit(`send:${user.id}`, RATE_LIMITS.send)
     if (!limit.success) {
       return rateLimitResponse(limit)
     }
@@ -49,12 +57,7 @@ export async function POST(request: Request) {
     // (conversation, whatsapp_config, message_templates) is account-
     // scoped post-multi-user, so the previous `user_id` filters
     // returned nothing for teammates who didn't author the row.
-    const { data: profile } = await supabase
-      .from('profiles')
-      .select('account_id')
-      .eq('user_id', user.id)
-      .maybeSingle()
-    const accountId = profile?.account_id as string | undefined
+    const accountId = await resolveAccountId(user.id)
     if (!accountId) {
       return NextResponse.json(
         { error: 'Your profile is not linked to an account.' },
@@ -134,14 +137,17 @@ export async function POST(request: Request) {
     }
 
     // Fetch conversation and contact
-    const { data: conversation, error: convError } = await supabase
-      .from('conversations')
-      .select('*, contact:contacts(*)')
-      .eq('id', conversation_id)
-      .eq('account_id', accountId)
-      .single()
+    const conversationRows = (await db.execute(sql`
+      SELECT c.*, row_to_json(ct.*) AS contact
+      FROM conversations c
+      JOIN contacts ct ON ct.id = c.contact_id
+      WHERE c.id = ${conversation_id}
+        AND c.account_id = ${accountId}
+      LIMIT 1
+    `)) as DbRow[]
+    const conversation = conversationRows[0]
 
-    if (convError || !conversation) {
+    if (!conversation) {
       return NextResponse.json(
         { error: 'Conversation not found' },
         { status: 404 }
@@ -156,6 +162,15 @@ export async function POST(request: Request) {
       )
     }
 
+    // Block sends to opted-out contacts — enforces "opt-out işlemlerini
+    // anlık uygulayabilme" from the technical spec.
+    if (contact.opted_out) {
+      return NextResponse.json(
+        { error: 'Contact has opted out of WhatsApp messages and cannot be messaged.' },
+        { status: 422 }
+      )
+    }
+
     // Sanitize and validate phone
     const sanitizedPhone = sanitizePhoneForMeta(contact.phone)
     if (!isValidE164(sanitizedPhone)) {
@@ -166,13 +181,15 @@ export async function POST(request: Request) {
     }
 
     // Fetch and decrypt WhatsApp config
-    const { data: config, error: configError } = await supabase
-      .from('whatsapp_config')
-      .select('*')
-      .eq('account_id', accountId)
-      .single()
+    const configRows = (await db.execute(sql`
+      SELECT *
+      FROM whatsapp_config
+      WHERE account_id = ${accountId}
+      LIMIT 1
+    `)) as DbRow[]
+    const config = configRows[0]
 
-    if (configError || !config) {
+    if (!config) {
       return NextResponse.json(
         { error: 'WhatsApp not configured. Please set up your WhatsApp integration first.' },
         { status: 400 }
@@ -187,18 +204,16 @@ export async function POST(request: Request) {
     // concurrent sends both produce valid GCM ciphertexts of the same
     // plaintext, last write wins.
     if (isLegacyFormat(config.access_token)) {
-      void supabase
-        .from('whatsapp_config')
-        .update({ access_token: encrypt(accessToken) })
-        .eq('id', config.id)
-        .then(({ error }) => {
-          if (error) {
-            console.warn(
-              '[whatsapp/send] access_token GCM upgrade failed:',
-              error.message,
-            )
-          }
-        })
+      void db.execute(sql`
+        UPDATE whatsapp_config
+        SET access_token = ${encrypt(accessToken)}, updated_at = NOW()
+        WHERE id = ${config.id}
+      `).catch((error) => {
+        console.warn(
+          '[whatsapp/send] access_token GCM upgrade failed:',
+          error instanceof Error ? error.message : error,
+        )
+      })
     }
 
     // Resolve the reply target (if any) to its Meta message_id, which is
@@ -207,14 +222,16 @@ export async function POST(request: Request) {
     // could quote messages they can't see by guessing UUIDs.
     let contextMessageId: string | undefined
     if (reply_to_message_id) {
-      const { data: parent, error: parentError } = await supabase
-        .from('messages')
-        .select('message_id, conversation_id')
-        .eq('id', reply_to_message_id)
-        .eq('conversation_id', conversation_id)
-        .maybeSingle()
+      const parentRows = (await db.execute(sql`
+        SELECT message_id, conversation_id
+        FROM messages
+        WHERE id = ${reply_to_message_id}
+          AND conversation_id = ${conversation_id}
+        LIMIT 1
+      `)) as DbRow[]
+      const parent = parentRows[0]
 
-      if (parentError || !parent) {
+      if (!parent) {
         return NextResponse.json(
           { error: 'reply_to_message_id not found in this conversation' },
           { status: 400 }
@@ -242,23 +259,20 @@ export async function POST(request: Request) {
 
     // For template sends, load the row so sendTemplateMessage can
     // build header + button components from the template definition.
-    // Match on (user_id, name, language) — same triple the unique
-    // index enforces — so multi-language templates work correctly.
-    // Missing template falls through with `templateRow = null` and
-    // the legacy body-only path runs.
-    // Load the template row so sendTemplateMessage can build header
-    // + button components from the definition. isMessageTemplate
-    // guards against a malformed row (e.g. from a partial sync)
-    // crashing the send-builder later in the stack.
+    // Match on (account_id, name, language) so multi-language templates
+    // work correctly. Missing template falls through with `templateRow = null`
+    // and the legacy body-only path runs.
     let templateRow: MessageTemplate | null = null
     if (message_type === 'template' && template_name) {
-      const { data } = await supabase
-        .from('message_templates')
-        .select('*')
-        .eq('account_id', accountId)
-        .eq('name', template_name)
-        .eq('language', template_language || 'en_US')
-        .maybeSingle()
+      const templateRows = (await db.execute(sql`
+        SELECT *
+        FROM message_templates
+        WHERE account_id = ${accountId}
+          AND name = ${template_name}
+          AND language = ${template_language || 'en_US'}
+        LIMIT 1
+      `)) as DbRow[]
+      const data = templateRows[0]
       if (data && !isMessageTemplate(data)) {
         return NextResponse.json(
           {
@@ -354,49 +368,62 @@ export async function POST(request: Request) {
       console.log(
         `[whatsapp/send] Auto-corrected contact phone: ${sanitizedPhone} → ${workingPhone}`
       )
-      await supabase
-        .from('contacts')
-        .update({ phone: workingPhone })
-        .eq('id', contact.id)
+      await db.execute(sql`
+        UPDATE contacts
+        SET phone = ${workingPhone}, updated_at = NOW()
+        WHERE id = ${contact.id}
+          AND account_id = ${accountId}
+      `)
     }
 
-    // Insert message into DB — field names MUST match the messages schema
-    // (see supabase/migrations/001_initial_schema.sql):
+    // Insert message into DB — field names MUST match the messages schema:
     //   conversation_id, sender_type, content_type, content_text,
     //   media_url, template_name, message_id, status, created_at
-    const { data: messageRecord, error: msgError } = await supabase
-      .from('messages')
-      .insert({
-        conversation_id,
-        sender_type: 'agent',
-        content_type: message_type,
-        content_text: content_text || null,
-        media_url: media_url || null,
-        template_name: template_name || null,
-        message_id: waMessageId,
-        status: 'sent',
-        reply_to_message_id: reply_to_message_id || null,
-      })
-      .select()
-      .single()
-
-    if (msgError) {
+    let messageRecord: DbRow
+    try {
+      const messageRows = (await db.execute(sql`
+        INSERT INTO messages (
+          conversation_id,
+          sender_type,
+          content_type,
+          content_text,
+          media_url,
+          template_name,
+          message_id,
+          status,
+          reply_to_message_id
+        ) VALUES (
+          ${conversation_id},
+          'agent',
+          ${message_type},
+          ${content_text || null},
+          ${media_url || null},
+          ${template_name || null},
+          ${waMessageId},
+          'sent',
+          ${reply_to_message_id || null}
+        )
+        RETURNING *
+      `)) as DbRow[]
+      messageRecord = messageRows[0]
+    } catch (msgError) {
       console.error('Error inserting sent message:', msgError)
+      const message = msgError instanceof Error ? msgError.message : String(msgError)
       return NextResponse.json(
-        { error: `Message sent to Meta but failed to save to DB: ${msgError.message}` },
+        { error: `Message sent to Meta but failed to save to DB: ${message}` },
         { status: 500 }
       )
     }
 
     // Update conversation
-    await supabase
-      .from('conversations')
-      .update({
-        last_message_text: content_text || `[${message_type}]`,
-        last_message_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      })
-      .eq('id', conversation_id)
+    await db.execute(sql`
+      UPDATE conversations
+      SET last_message_text = ${content_text || `[${message_type}]`},
+          last_message_at = NOW(),
+          updated_at = NOW()
+      WHERE id = ${conversation_id}
+        AND account_id = ${accountId}
+    `)
 
     // Pause any active Flow run for this contact — the agent stepping
     // in is the strongest "yield, human is here" signal. See PR #2
@@ -405,23 +432,15 @@ export async function POST(request: Request) {
     // run later. For accounts with no active runs the UPDATE matches
     // zero rows — cheap and harmless.
     try {
-      const { error: pauseErr } = await supabaseAdmin()
-        .from('flow_runs')
-        .update({
-          status: 'paused_by_agent',
-          ended_at: new Date().toISOString(),
-          end_reason: 'agent_replied',
-        })
-        .eq('account_id', accountId)
-        .eq('contact_id', contact.id)
-        .eq('status', 'active')
-      if (pauseErr) {
-        // Best-effort — log + continue. The agent's message already
-        // landed at Meta; don't fail the response over a bookkeeping
-        // miss. Worst case: a stale active run gets caught by the
-        // stale-run cron sweep within 24h.
-        console.error('[flows] pause-on-agent-send failed:', pauseErr.message)
-      }
+      await db.execute(sql`
+        UPDATE flow_runs
+        SET status = 'paused_by_agent',
+            ended_at = NOW(),
+            end_reason = 'agent_replied'
+        WHERE account_id = ${accountId}
+          AND contact_id = ${contact.id}
+          AND status = 'active'
+      `)
     } catch (err) {
       console.error(
         '[flows] pause-on-agent-send threw:',

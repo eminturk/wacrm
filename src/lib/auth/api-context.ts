@@ -3,33 +3,27 @@
 // account context.
 //
 // This is the machine-to-machine counterpart of `getCurrentAccount`
-// (cookie session → account). Where the dashboard authenticates a
-// human via Supabase cookies, the public API authenticates a caller
-// via `Authorization: Bearer wacrm_live_…`.
+// (cookie session → account). The public API authenticates a caller
+// via `Authorization: ******
 //
 // Calling convention — every `/api/v1` route does:
 //
 //   try {
 //     const ctx = await requireApiKey(request, "messages:send");
-//     // ctx.supabase   — service-role client (no user session exists)
+//     // ctx.db         — the Drizzle handle
 //     // ctx.accountId  — the key's account; scope every query by it
 //     // ctx.scopes     — granted scopes
 //     // ctx.keyId      — for logging / the rate-limit bucket
 //   } catch (err) {
-//     return toApiErrorResponse(err);   // maps ApiError → envelope
+//     return toApiErrorResponse(err);
 //   }
 //
-// Why a service-role client: an API caller has no Supabase session,
-// so there's no `auth.uid()` for RLS to match. The key lookup itself
-// establishes the account; from there every downstream query MUST be
-// explicitly filtered by `ctx.accountId` (the same discipline the
-// dashboard's send route already follows). The key never escalates
-// past its own account because the account is fixed at lookup time.
+// There is no Postgres RLS anymore: the key lookup establishes the
+// account, and from there every downstream query MUST be explicitly
+// filtered by `ctx.accountId`.
 // ============================================================
 
-import type { SupabaseClient } from '@supabase/supabase-js';
-
-import { supabaseAdmin } from '@/lib/flows/admin-client';
+import { db } from '@/lib/db';
 import { findActiveKeyByHash, touchLastUsed } from '@/lib/api-keys/store';
 import { hashApiKey, looksLikeApiKey } from '@/lib/api-keys/keys';
 import { hasScope, type ApiScope } from '@/lib/api-keys/scopes';
@@ -39,8 +33,8 @@ import { checkRateLimit, RATE_LIMITS } from '@/lib/rate-limit';
 export interface ApiKeyContext {
   /** Discriminant — lets shared logic tell key auth from cookie auth. */
   authType: 'api_key';
-  /** Service-role Supabase client. RLS-bypassing; scope by accountId. */
-  supabase: SupabaseClient;
+  /** Drizzle database handle. Scope every query by `accountId`. */
+  db: typeof db;
   /** The account this key belongs to. */
   accountId: string;
   /** The key row id — for audit logging and the rate-limit bucket. */
@@ -53,8 +47,6 @@ export interface ApiKeyContext {
 
 /**
  * Extract the bearer token from the `Authorization` header.
- * Tolerates the `Bearer ` prefix being absent (some clients send the
- * bare key) but requires the value to look like one of our keys.
  */
 function extractKey(request: Request): string | null {
   const header = request.headers.get('authorization');
@@ -66,15 +58,9 @@ function extractKey(request: Request): string | null {
 }
 
 /**
- * Authenticate a public-API request and (optionally) enforce a
- * single scope. Throws an `ApiError` (mapped to the envelope by
- * `toApiErrorResponse`) on any failure:
- *
- *   401 unauthorized — no key, malformed, unknown, revoked, expired
- *   403 forbidden    — valid key without the required scope
- *   429 rate_limited — per-key budget exhausted
- *
- * On success, bumps `last_used_at` (fire-and-forget) and returns the
+ * Authenticate a public-API request and (optionally) enforce a single
+ * scope. Throws an `ApiError` on failure (401 / 403 / 429). On
+ * success, bumps `last_used_at` (fire-and-forget) and returns the
  * account context.
  */
 export async function requireApiKey(
@@ -88,15 +74,11 @@ export async function requireApiKey(
 
   const row = await findActiveKeyByHash(hashApiKey(presented));
   if (!row) {
-    // Covers unknown, revoked, and expired keys alike — we don't
-    // distinguish them on the wire so a probe can't learn whether a
-    // key ever existed.
     throw unauthorized();
   }
 
-  // Rate-limit per key, before the scope check, so an unauthorized-
-  // scope caller still can't hammer the endpoint for free.
-  const limit = checkRateLimit(`apikey:${row.id}`, RATE_LIMITS.publicApi);
+  // Rate-limit per key, before the scope check.
+  const limit = await checkRateLimit(`apikey:${row.id}`, RATE_LIMITS.publicApi);
   if (!limit.success) {
     throw rateLimited(limit);
   }
@@ -109,7 +91,7 @@ export async function requireApiKey(
 
   return {
     authType: 'api_key',
-    supabase: supabaseAdmin(),
+    db,
     accountId: row.account_id,
     keyId: row.id,
     scopes: row.scopes,

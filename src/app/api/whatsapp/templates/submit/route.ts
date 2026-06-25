@@ -1,6 +1,7 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import { NextResponse } from 'next/server'
-import type { SupabaseClient } from '@supabase/supabase-js'
-import { createClient } from '@/lib/supabase/server'
+import { db, sql } from '@/lib/db'
+import { getSession } from '@/lib/auth/session'
 import { decrypt } from '@/lib/whatsapp/encryption'
 import { submitMessageTemplate } from '@/lib/whatsapp/meta-api'
 import {
@@ -10,6 +11,8 @@ import {
 import { buildMetaTemplatePayload } from '@/lib/whatsapp/template-components'
 import { ensureImageHeaderHandle } from '@/lib/whatsapp/template-header-handle'
 import { normalizeStatus } from '@/lib/whatsapp/template-status-normalize'
+
+type DbRow = Record<string, any>
 
 /**
  * Shared upsert payload builder — both the Meta-failure path and the
@@ -44,32 +47,93 @@ function buildUpsertRow(
     header_handle: payload.header_handle ?? null,
     body_text: payload.body_text,
     footer_text: payload.footer_text ?? null,
-    buttons: payload.buttons ?? null,
-    sample_values: payload.sample_values ?? null,
+    buttons: payload.buttons ? JSON.stringify(payload.buttons) : null,
+    sample_values: payload.sample_values ? JSON.stringify(payload.sample_values) : null,
     status: extras.status,
     meta_template_id: extras.metaTemplateId,
     submission_error: extras.submissionError,
     // Clear stale rejection_reason whenever we re-submit; the
     // webhook will set it again if Meta still rejects.
-    rejection_reason: extras.submissionError ? null : null,
-    last_submitted_at: new Date().toISOString(),
+    rejection_reason: null,
   }
 }
 
 async function upsertTemplateRow(
-  supabase: SupabaseClient,
   row: ReturnType<typeof buildUpsertRow>,
-) {
-  // TODO(account-sharing): conflict target is still scoped to
-  // user_id. Once a follow-up migration drops the legacy unique
-  // index on (user_id, name, language) and adds (account_id,
-  // name, language), switch `onConflict` here so two teammates
-  // can't shadow each other's same-named template.
-  return supabase
-    .from('message_templates')
-    .upsert(row, { onConflict: 'user_id,name,language' })
-    .select()
-    .single()
+): Promise<DbRow> {
+  const rows = (await db.execute(sql`
+    INSERT INTO message_templates (
+      account_id,
+      user_id,
+      name,
+      category,
+      language,
+      header_type,
+      header_content,
+      header_media_url,
+      header_handle,
+      body_text,
+      footer_text,
+      buttons,
+      sample_values,
+      status,
+      meta_template_id,
+      submission_error,
+      rejection_reason,
+      last_submitted_at,
+      updated_at
+    ) VALUES (
+      ${row.account_id},
+      ${row.user_id},
+      ${row.name},
+      ${row.category},
+      ${row.language},
+      ${row.header_type},
+      ${row.header_content},
+      ${row.header_media_url},
+      ${row.header_handle},
+      ${row.body_text},
+      ${row.footer_text},
+      ${row.buttons}::jsonb,
+      ${row.sample_values}::jsonb,
+      ${row.status},
+      ${row.meta_template_id},
+      ${row.submission_error},
+      ${row.rejection_reason},
+      NOW(),
+      NOW()
+    )
+    ON CONFLICT (user_id, name, language)
+    DO UPDATE SET
+      account_id = EXCLUDED.account_id,
+      category = EXCLUDED.category,
+      header_type = EXCLUDED.header_type,
+      header_content = EXCLUDED.header_content,
+      header_media_url = EXCLUDED.header_media_url,
+      header_handle = EXCLUDED.header_handle,
+      body_text = EXCLUDED.body_text,
+      footer_text = EXCLUDED.footer_text,
+      buttons = EXCLUDED.buttons,
+      sample_values = EXCLUDED.sample_values,
+      status = EXCLUDED.status,
+      meta_template_id = EXCLUDED.meta_template_id,
+      submission_error = EXCLUDED.submission_error,
+      rejection_reason = EXCLUDED.rejection_reason,
+      last_submitted_at = EXCLUDED.last_submitted_at,
+      updated_at = NOW()
+    RETURNING *
+  `)) as DbRow[]
+  return rows[0]
+}
+
+async function resolveAccountId(userId: string): Promise<string | null> {
+  const rows = (await db.execute(sql`
+    SELECT account_id
+    FROM profiles
+    WHERE user_id = ${userId}
+    LIMIT 1
+  `)) as DbRow[]
+  return rows[0]?.account_id ?? null
 }
 
 /**
@@ -88,23 +152,14 @@ async function upsertTemplateRow(
  */
 export async function POST(request: Request) {
   try {
-    const supabase = await createClient()
-    const {
-      data: { user },
-      error: authError,
-    } = await supabase.auth.getUser()
-    if (authError || !user) {
+    const user = await getSession()
+    if (!user) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
     // Resolve the caller's account_id — whatsapp_config + the
     // message_templates row are account-scoped post-multi-user.
-    const { data: profile } = await supabase
-      .from('profiles')
-      .select('account_id')
-      .eq('user_id', user.id)
-      .maybeSingle()
-    const accountId = profile?.account_id as string | undefined
+    const accountId = await resolveAccountId(user.id)
     if (!accountId) {
       return NextResponse.json(
         { error: 'Your profile is not linked to an account.' },
@@ -149,12 +204,14 @@ export async function POST(request: Request) {
       metaTemplateId = `dry-run-${crypto.randomUUID()}`
       metaStatus = 'PENDING'
     } else {
-      const { data: config, error: configError } = await supabase
-        .from('whatsapp_config')
-        .select('*')
-        .eq('account_id', accountId)
-        .single()
-      if (configError || !config) {
+      const configRows = (await db.execute(sql`
+        SELECT *
+        FROM whatsapp_config
+        WHERE account_id = ${accountId}
+        LIMIT 1
+      `)) as DbRow[]
+      const config = configRows[0]
+      if (!config) {
         return NextResponse.json(
           {
             error:
@@ -202,7 +259,6 @@ export async function POST(request: Request) {
         // Persist the failure so the user can retry; row stays DRAFT
         // until they fix and re-submit.
         await upsertTemplateRow(
-          supabase,
           buildUpsertRow(accountId, user.id, payload, {
             status: 'DRAFT',
             metaTemplateId: null,
@@ -221,22 +277,23 @@ export async function POST(request: Request) {
       }
     }
 
-    const { data: row, error: upsertErr } = await upsertTemplateRow(
-      supabase,
-      buildUpsertRow(accountId, user.id, payload, {
-        status: normalizeStatus(metaStatus),
-        metaTemplateId,
-        submissionError: null,
-      }),
-    )
-
-    if (upsertErr) {
+    let row: DbRow
+    try {
+      row = await upsertTemplateRow(
+        buildUpsertRow(accountId, user.id, payload, {
+          status: normalizeStatus(metaStatus),
+          metaTemplateId,
+          submissionError: null,
+        }),
+      )
+    } catch (upsertErr) {
       // The submit succeeded on Meta's side but we failed to persist
       // locally. That's a data-drift state — surface the meta_template_id
       // so the user can recover via "Sync from Meta".
+      const message = upsertErr instanceof Error ? upsertErr.message : String(upsertErr)
       return NextResponse.json(
         {
-          error: `Submitted to Meta but failed to save locally: ${upsertErr.message}. Run "Sync from Meta" to recover.`,
+          error: `Submitted to Meta but failed to save locally: ${message}. Run "Sync from Meta" to recover.`,
           meta_template_id: metaTemplateId,
         },
         { status: 500 },

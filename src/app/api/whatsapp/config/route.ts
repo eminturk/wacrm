@@ -1,12 +1,15 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import { NextResponse } from 'next/server'
-import { createClient } from '@/lib/supabase/server'
-import { createClient as createAdminClient } from '@supabase/supabase-js'
+import { db, sql } from '@/lib/db'
+import { getSession } from '@/lib/auth/session'
 import {
   registerPhoneNumber,
   subscribeWabaToApp,
   verifyPhoneNumber,
 } from '@/lib/whatsapp/meta-api'
 import { encrypt, decrypt } from '@/lib/whatsapp/encryption'
+
+type DbRow = Record<string, any>
 
 /**
  * Resolve the caller's account_id from their profile. Inlined here
@@ -18,33 +21,14 @@ import { encrypt, decrypt } from '@/lib/whatsapp/encryption'
  * Returns null if the user has no profile or no account; callers
  * should treat that the same as "not connected".
  */
-async function resolveAccountId(
-  supabase: Awaited<ReturnType<typeof createClient>>,
-  userId: string,
-): Promise<string | null> {
-  const { data, error } = await supabase
-    .from('profiles')
-    .select('account_id')
-    .eq('user_id', userId)
-    .maybeSingle()
-  if (error || !data?.account_id) return null
-  return data.account_id as string
-}
-
-// Lazy-initialised service-role client. We need it to detect a
-// phone_number_id already claimed by a *different* user — under RLS,
-// the user's own session can't see other users' rows, so the conflict
-// would be invisible without the service role.
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-let _adminClient: any = null
-function supabaseAdmin() {
-  if (!_adminClient) {
-    _adminClient = createAdminClient(
-      process.env.NEXT_PUBLIC_SUPABASE_URL!,
-      process.env.SUPABASE_SERVICE_ROLE_KEY!
-    )
-  }
-  return _adminClient
+async function resolveAccountId(userId: string): Promise<string | null> {
+  const rows = (await db.execute(sql`
+    SELECT account_id
+    FROM profiles
+    WHERE user_id = ${userId}
+    LIMIT 1
+  `)) as DbRow[]
+  return rows[0]?.account_id ?? null
 }
 
 /**
@@ -62,18 +46,13 @@ function supabaseAdmin() {
  */
 export async function GET() {
   try {
-    const supabase = await createClient()
+    const user = await getSession()
 
-    const {
-      data: { user },
-      error: authError,
-    } = await supabase.auth.getUser()
-
-    if (authError || !user) {
+    if (!user) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
-    const accountId = await resolveAccountId(supabase, user.id)
+    const accountId = await resolveAccountId(user.id)
     if (!accountId) {
       return NextResponse.json(
         {
@@ -85,13 +64,16 @@ export async function GET() {
       )
     }
 
-    const { data: config, error: configError } = await supabase
-      .from('whatsapp_config')
-      .select('phone_number_id, access_token, status')
-      .eq('account_id', accountId)
-      .maybeSingle()
-
-    if (configError) {
+    let config: DbRow | undefined
+    try {
+      const rows = (await db.execute(sql`
+        SELECT id, user_id, account_id, phone_number_id, waba_id, access_token, verify_token, status, connected_at, registered_at, subscribed_apps_at, last_registration_error, created_at, updated_at
+        FROM whatsapp_config
+        WHERE account_id = ${accountId}
+        LIMIT 1
+      `)) as DbRow[]
+      config = rows[0]
+    } catch (configError) {
       console.error('Error fetching whatsapp_config:', configError)
       return NextResponse.json(
         { connected: false, reason: 'db_error', message: 'Failed to fetch configuration' },
@@ -120,6 +102,20 @@ export async function GET() {
       return NextResponse.json(
         {
           connected: false,
+          config: {
+            id: config.id,
+            user_id: config.user_id,
+            account_id: config.account_id,
+            phone_number_id: config.phone_number_id,
+            waba_id: config.waba_id,
+            status: config.status,
+            connected_at: config.connected_at,
+            registered_at: config.registered_at,
+            subscribed_apps_at: config.subscribed_apps_at,
+            last_registration_error: config.last_registration_error,
+            created_at: config.created_at,
+            updated_at: config.updated_at,
+          },
           reason: 'token_corrupted',
           needs_reset: true,
           message:
@@ -135,13 +131,44 @@ export async function GET() {
         phoneNumberId: config.phone_number_id,
         accessToken,
       })
-      return NextResponse.json({ connected: true, phone_info: phoneInfo })
+      return NextResponse.json({
+        connected: true,
+        phone_info: phoneInfo,
+        config: {
+          id: config.id,
+          user_id: config.user_id,
+          account_id: config.account_id,
+          phone_number_id: config.phone_number_id,
+          waba_id: config.waba_id,
+          status: config.status,
+          connected_at: config.connected_at,
+          registered_at: config.registered_at,
+          subscribed_apps_at: config.subscribed_apps_at,
+          last_registration_error: config.last_registration_error,
+          created_at: config.created_at,
+          updated_at: config.updated_at,
+        },
+      })
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Unknown Meta API error'
       console.error('[whatsapp/config GET] Meta API verification failed:', message)
       return NextResponse.json(
         {
           connected: false,
+          config: {
+            id: config.id,
+            user_id: config.user_id,
+            account_id: config.account_id,
+            phone_number_id: config.phone_number_id,
+            waba_id: config.waba_id,
+            status: config.status,
+            connected_at: config.connected_at,
+            registered_at: config.registered_at,
+            subscribed_apps_at: config.subscribed_apps_at,
+            last_registration_error: config.last_registration_error,
+            created_at: config.created_at,
+            updated_at: config.updated_at,
+          },
           reason: 'meta_api_error',
           message: `Meta API rejected the credentials: ${message}`,
         },
@@ -165,18 +192,13 @@ export async function GET() {
  */
 export async function POST(request: Request) {
   try {
-    const supabase = await createClient()
+    const user = await getSession()
 
-    const {
-      data: { user },
-      error: authError,
-    } = await supabase.auth.getUser()
-
-    if (authError || !user) {
+    if (!user) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
-    const accountId = await resolveAccountId(supabase, user.id)
+    const accountId = await resolveAccountId(user.id)
     if (!accountId) {
       return NextResponse.json(
         { error: 'Your profile is not linked to an account.' },
@@ -205,27 +227,17 @@ export async function POST(request: Request) {
 
     // Reject if another account has already claimed this phone_number_id.
     // wacrm is single-tenant-per-WhatsApp-number — letting two accounts
-    // bind the same number causes the webhook's `.single()` lookup to
-    // throw PGRST116 ("multiple rows"), silently dropping every
-    // inbound message. See issue #136. Post-multi-user we key on
-    // account_id (not user_id) since teammates inside the same account
-    // all share one config; the conflict is between accounts.
-    const { data: claimed, error: claimedError } = await supabaseAdmin()
-      .from('whatsapp_config')
-      .select('account_id')
-      .eq('phone_number_id', phone_number_id)
-      .neq('account_id', accountId)
-      .maybeSingle()
+    // bind the same number causes the webhook lookup to match multiple
+    // rows, silently dropping every inbound message. See issue #136.
+    const claimedRows = (await db.execute(sql`
+      SELECT account_id
+      FROM whatsapp_config
+      WHERE phone_number_id = ${phone_number_id}
+        AND account_id <> ${accountId}
+      LIMIT 1
+    `)) as DbRow[]
 
-    if (claimedError) {
-      console.error('Error checking phone_number_id ownership:', claimedError)
-      return NextResponse.json(
-        { error: 'Failed to validate configuration' },
-        { status: 500 }
-      )
-    }
-
-    if (claimed) {
+    if (claimedRows[0]) {
       return NextResponse.json(
         {
           error:
@@ -272,11 +284,13 @@ export async function POST(request: Request) {
     // Look up any pre-existing row for this account so we know whether
     // this number is already registered with Meta — if so we can skip
     // /register when the user didn't provide a PIN this time around.
-    const { data: existing } = await supabase
-      .from('whatsapp_config')
-      .select('id, registered_at, phone_number_id')
-      .eq('account_id', accountId)
-      .maybeSingle()
+    const existingRows = (await db.execute(sql`
+      SELECT id, registered_at, phone_number_id
+      FROM whatsapp_config
+      WHERE account_id = ${accountId}
+      LIMIT 1
+    `)) as DbRow[]
+    const existing = existingRows[0]
 
     const sameNumber =
       existing?.phone_number_id === phone_number_id &&
@@ -289,7 +303,7 @@ export async function POST(request: Request) {
     // when the same number is already registered and no PIN was
     // supplied — re-registering an already-active number with a
     // stale PIN would actually fail and undo the active subscription.
-    let registeredAt: string | null = existing?.registered_at ?? null
+    let registeredAt: Date | null = existing?.registered_at ?? null
     let registrationError: string | null = null
     // True when registration was deliberately skipped because no PIN
     // was supplied (see below). Distinct from registrationError — this
@@ -316,7 +330,7 @@ export async function POST(request: Request) {
             accessToken: access_token,
             pin,
           })
-          registeredAt = new Date().toISOString()
+          registeredAt = new Date()
         } catch (err) {
           registrationError =
             err instanceof Error ? err.message : 'Unknown Meta API error'
@@ -333,14 +347,14 @@ export async function POST(request: Request) {
     // side, so we call on every save and persist the timestamp.
     // Skipped only when there's no waba_id (legacy rows from before
     // we required it).
-    let subscribedAppsAt: string | null = null
+    let subscribedAppsAt: Date | null = null
     if (waba_id) {
       try {
         await subscribeWabaToApp({
           wabaId: waba_id,
           accessToken: access_token,
         })
-        subscribedAppsAt = new Date().toISOString()
+        subscribedAppsAt = new Date()
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err)
         console.warn('WABA subscribed_apps failed (non-fatal):', message)
@@ -353,26 +367,27 @@ export async function POST(request: Request) {
     // Persist everything in one shot. If /register failed we still
     // store the credentials and the error so the UI can guide the
     // user through a retry.
-    const baseRow = {
-      phone_number_id,
-      waba_id: waba_id || null,
-      access_token: encryptedAccessToken,
-      verify_token: encryptedVerifyToken,
-      status: registrationError ? 'disconnected' : 'connected',
-      connected_at: registrationError ? null : new Date().toISOString(),
-      registered_at: registrationError ? null : registeredAt,
-      subscribed_apps_at: subscribedAppsAt ?? null,
-      last_registration_error: registrationError,
-      updated_at: new Date().toISOString(),
-    }
+    const status = registrationError ? 'disconnected' : 'connected'
+    const connectedAt = registrationError ? null : new Date()
+    const finalRegisteredAt = registrationError ? null : registeredAt
 
     if (existing) {
-      const { error: updateError } = await supabase
-        .from('whatsapp_config')
-        .update(baseRow)
-        .eq('account_id', accountId)
-
-      if (updateError) {
+      try {
+        await db.execute(sql`
+          UPDATE whatsapp_config
+          SET phone_number_id = ${phone_number_id},
+              waba_id = ${waba_id || null},
+              access_token = ${encryptedAccessToken},
+              verify_token = ${encryptedVerifyToken},
+              status = ${status},
+              connected_at = ${connectedAt},
+              registered_at = ${finalRegisteredAt},
+              subscribed_apps_at = ${subscribedAppsAt},
+              last_registration_error = ${registrationError},
+              updated_at = NOW()
+          WHERE account_id = ${accountId}
+        `)
+      } catch (updateError) {
         console.error('Error updating whatsapp_config:', updateError)
         return NextResponse.json(
           { error: 'Failed to update configuration' },
@@ -384,15 +399,37 @@ export async function POST(request: Request) {
       // (NOT NULL post-017, UNIQUE so duplicates trip the constraint
       // up-front), `user_id` is the audit column identifying which
       // member of the account saved the config.
-      const { error: insertError } = await supabase
-        .from('whatsapp_config')
-        .insert({
-          account_id: accountId,
-          user_id: user.id,
-          ...baseRow,
-        })
-
-      if (insertError) {
+      try {
+        await db.execute(sql`
+          INSERT INTO whatsapp_config (
+            account_id,
+            user_id,
+            phone_number_id,
+            waba_id,
+            access_token,
+            verify_token,
+            status,
+            connected_at,
+            registered_at,
+            subscribed_apps_at,
+            last_registration_error,
+            updated_at
+          ) VALUES (
+            ${accountId},
+            ${user.id},
+            ${phone_number_id},
+            ${waba_id || null},
+            ${encryptedAccessToken},
+            ${encryptedVerifyToken},
+            ${status},
+            ${connectedAt},
+            ${finalRegisteredAt},
+            ${subscribedAppsAt},
+            ${registrationError},
+            NOW()
+          )
+        `)
+      } catch (insertError) {
         console.error('Error inserting whatsapp_config:', insertError)
         return NextResponse.json(
           { error: 'Failed to save configuration' },
@@ -440,18 +477,13 @@ export async function POST(request: Request) {
  */
 export async function DELETE() {
   try {
-    const supabase = await createClient()
+    const user = await getSession()
 
-    const {
-      data: { user },
-      error: authError,
-    } = await supabase.auth.getUser()
-
-    if (authError || !user) {
+    if (!user) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
-    const accountId = await resolveAccountId(supabase, user.id)
+    const accountId = await resolveAccountId(user.id)
     if (!accountId) {
       return NextResponse.json(
         { error: 'Your profile is not linked to an account.' },
@@ -459,12 +491,12 @@ export async function DELETE() {
       )
     }
 
-    const { error: deleteError } = await supabase
-      .from('whatsapp_config')
-      .delete()
-      .eq('account_id', accountId)
-
-    if (deleteError) {
+    try {
+      await db.execute(sql`
+        DELETE FROM whatsapp_config
+        WHERE account_id = ${accountId}
+      `)
+    } catch (deleteError) {
       console.error('Error deleting whatsapp_config:', deleteError)
       return NextResponse.json(
         { error: 'Failed to delete configuration' },

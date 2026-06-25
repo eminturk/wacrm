@@ -1,9 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useCallback, useState } from "react";
-import { createClient } from "@/lib/supabase/client";
 import type { Message, Conversation } from "@/types";
-import type { RealtimeChannel } from "@supabase/supabase-js";
 
 interface RealtimeEvent<T> {
   eventType: "INSERT" | "UPDATE" | "DELETE";
@@ -18,20 +16,31 @@ interface UseRealtimeOptions {
   enabled?: boolean;
 }
 
+interface NotifyPayload {
+  table: string;
+  op: "INSERT" | "UPDATE" | "DELETE";
+  id: string | null;
+  account_id: string | null;
+  conversation_id: string | null;
+}
+
+/**
+ * Realtime subscription over Server-Sent Events (replaces the Supabase
+ * Realtime channel). Connects to `/api/realtime`, which streams
+ * pg_notify events from the database (migration 027 triggers).
+ *
+ * The SSE payload only carries identifiers — consumers should treat an
+ * event as "something changed, refetch" rather than relying on a full
+ * row. `new`/`old` are populated with the ids that are available.
+ */
 export function useRealtime({
-  channelName,
   onMessageEvent,
   onConversationEvent,
   enabled = true,
 }: UseRealtimeOptions) {
-  const channelRef = useRef<RealtimeChannel | null>(null);
+  const esRef = useRef<EventSource | null>(null);
   const [isConnected, setIsConnected] = useState(false);
 
-  // Store latest callbacks in refs to avoid re-subscribing when the
-  // parent re-renders with fresh closures. Assigned inside an effect
-  // so the mutation doesn't happen during render (React 19's refs
-  // rule) — subscribers only read `.current` inside async Realtime
-  // callbacks, which always run after the render that updates it.
   const onMessageRef = useRef(onMessageEvent);
   const onConversationRef = useRef(onConversationEvent);
   useEffect(() => {
@@ -41,51 +50,55 @@ export function useRealtime({
 
   useEffect(() => {
     if (!enabled) return;
+    if (typeof window === "undefined") return;
 
-    const supabase = createClient();
+    const es = new EventSource("/api/realtime");
+    esRef.current = es;
 
-    const channel = supabase
-      .channel(channelName)
-      .on(
-        "postgres_changes",
-        { event: "*", schema: "public", table: "messages" },
-        (payload) => {
-          onMessageRef.current?.({
-            eventType: payload.eventType as RealtimeEvent<Message>["eventType"],
-            new: payload.new as Message,
-            old: payload.old as Partial<Message>,
-          });
-        }
-      )
-      .on(
-        "postgres_changes",
-        { event: "*", schema: "public", table: "conversations" },
-        (payload) => {
-          onConversationRef.current?.({
-            eventType: payload.eventType as RealtimeEvent<Conversation>["eventType"],
-            new: payload.new as Conversation,
-            old: payload.old as Partial<Conversation>,
-          });
-        }
-      )
-      .subscribe((status) => {
-        setIsConnected(status === "SUBSCRIBED");
-      });
+    es.addEventListener("ready", () => setIsConnected(true));
+    es.onopen = () => setIsConnected(true);
+    es.onerror = () => setIsConnected(false);
 
-    channelRef.current = channel;
+    es.addEventListener("message", (e) => {
+      try {
+        const payload = JSON.parse((e as MessageEvent).data) as NotifyPayload;
+        onMessageRef.current?.({
+          eventType: payload.op,
+          new: {
+            id: payload.id,
+            conversation_id: payload.conversation_id,
+          } as unknown as Message,
+          old: { id: payload.id ?? undefined } as Partial<Message>,
+        });
+      } catch {
+        // ignore malformed event
+      }
+    });
+
+    es.addEventListener("conversation", (e) => {
+      try {
+        const payload = JSON.parse((e as MessageEvent).data) as NotifyPayload;
+        onConversationRef.current?.({
+          eventType: payload.op,
+          new: { id: payload.id } as unknown as Conversation,
+          old: { id: payload.id ?? undefined } as Partial<Conversation>,
+        });
+      } catch {
+        // ignore malformed event
+      }
+    });
 
     return () => {
-      supabase.removeChannel(channel);
-      channelRef.current = null;
+      es.close();
+      esRef.current = null;
       setIsConnected(false);
     };
-  }, [channelName, enabled]);
+  }, [enabled]);
 
   const unsubscribe = useCallback(() => {
-    if (channelRef.current) {
-      const supabase = createClient();
-      supabase.removeChannel(channelRef.current);
-      channelRef.current = null;
+    if (esRef.current) {
+      esRef.current.close();
+      esRef.current = null;
       setIsConnected(false);
     }
   }, []);
