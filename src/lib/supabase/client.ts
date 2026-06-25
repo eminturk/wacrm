@@ -19,6 +19,7 @@ export interface AuthUser {
 
 export interface AuthResult {
   ok: boolean
+  mfaRequired?: boolean
   error?: string
 }
 
@@ -39,7 +40,12 @@ export async function getCurrentUser(): Promise<AuthUser | null> {
   return body.user ?? null
 }
 
-/** Email + password sign-in. On success the session cookie is set. */
+/**
+ * Email + password sign-in.
+ * - On success the session cookie is set and `ok: true` is returned.
+ * - When the account has MFA enabled `mfaRequired: true` is returned
+ *   instead; the caller should redirect to /mfa-verify.
+ */
 export async function signIn(
   email: string,
   password: string,
@@ -50,6 +56,8 @@ export async function signIn(
     body: JSON.stringify({ email, password }),
   })
   if (!res.ok) return { ok: false, error: await readError(res) }
+  const body = (await res.json()) as { ok?: boolean; mfaRequired?: boolean }
+  if (body.mfaRequired) return { ok: false, mfaRequired: true }
   return { ok: true }
 }
 
@@ -93,4 +101,9 @@ export async function updatePassword(password: string): Promise<AuthResult> {
   })
   if (!res.ok) return { ok: false, error: await readError(res) }
   return { ok: true }
+}
+
+/** Initiate Google OAuth login — navigates the browser to Google's consent screen. */
+export function signInWithGoogle(): void {
+  window.location.href = '/api/auth/oauth/google'
 }

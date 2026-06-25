@@ -10,6 +10,10 @@ import {
   sessionCookieOptions,
   SESSION_MAX_AGE_SECONDS,
 } from '@/lib/auth/session'
+import {
+  createPendingMfaSession,
+  PENDING_MFA_COOKIE,
+} from '@/lib/auth/mfa'
 import { writeAuditLog, getClientIp } from '@/lib/audit'
 
 export async function POST(request: Request) {
@@ -34,7 +38,11 @@ export async function POST(request: Request) {
   }
 
   const rows = await db
-    .select({ id: users.id, passwordHash: users.passwordHash })
+    .select({
+      id: users.id,
+      passwordHash: users.passwordHash,
+      mfaEnabled: users.mfaEnabled,
+    })
     .from(users)
     .where(eq(users.email, email))
     .limit(1)
@@ -56,6 +64,22 @@ export async function POST(request: Request) {
     })
     return NextResponse.json({ error: 'Invalid email or password' }, { status: 401 })
   }
+
+  // ---- MFA gate ----
+  if (user.mfaEnabled) {
+    const pendingToken = await createPendingMfaSession(user.id)
+    const res = NextResponse.json({ mfaRequired: true })
+    res.cookies.set(PENDING_MFA_COOKIE, pendingToken, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'lax',
+      path: '/',
+      maxAge: 600, // 10 minutes
+    })
+    return res
+  }
+
+  // ---- No MFA — issue session directly ----
 
   // Resolve account_id for the audit log
   const profileRows = await db
@@ -80,3 +104,4 @@ export async function POST(request: Request) {
   res.cookies.set(SESSION_COOKIE_NAME, token, sessionCookieOptions(SESSION_MAX_AGE_SECONDS))
   return res
 }
+

@@ -27,7 +27,6 @@ import {
 } from 'drizzle-orm/pg-core'
 
 // ---- helper for text[] columns (Drizzle doesn't ship a pg-array helper yet)
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
 import { customType } from 'drizzle-orm/pg-core'
 
 const textArray = customType<{ data: string[]; driverData: string }>({
@@ -62,6 +61,12 @@ export const users = pgTable('users', {
   id: uuid('id').primaryKey().defaultRandom(),
   email: text('email').notNull().unique(),
   passwordHash: text('password_hash').notNull(),
+  /** Base32-encoded TOTP secret, encrypted at rest. Null until MFA setup. */
+  mfaSecret: text('mfa_secret'),
+  /** Whether TOTP-based MFA is active for this user. */
+  mfaEnabled: boolean('mfa_enabled').notNull().default(false),
+  /** JSONB array of hashed single-use recovery codes. */
+  mfaRecoveryCodes: jsonb('mfa_recovery_codes').notNull().default([]),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
 })
 
@@ -78,6 +83,53 @@ export const sessions = pgTable(
   },
   (t) => [index('idx_sessions_user_id').on(t.userId)],
 )
+
+/**
+ * OAuth provider identities linked to a user.  A user may have both a
+ * local password and one or more OAuth logins.
+ */
+export const oauthAccounts = pgTable(
+  'oauth_accounts',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    provider: text('provider').notNull(),
+    providerUserId: text('provider_user_id').notNull(),
+    accessToken: text('access_token'),
+    refreshToken: text('refresh_token'),
+    expiresAt: timestamp('expires_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow(),
+  },
+  (t) => [
+    index('idx_oauth_accounts_user_id').on(t.userId),
+    unique('uq_oauth_provider_user').on(t.provider, t.providerUserId),
+  ],
+)
+
+/**
+ * Pending MFA sessions — password OK, TOTP verification still needed.
+ * The plaintext token is sent to the client; only its SHA-256 hash is stored.
+ */
+export const pendingMfaSessions = pgTable(
+  'pending_mfa_sessions',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tokenHash: text('token_hash').notNull().unique(),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
+  },
+  (t) => [
+    index('idx_pending_mfa_user_id').on(t.userId),
+    index('idx_pending_mfa_expires_at').on(t.expiresAt),
+  ],
+)
+
 
 // ============================================================
 // ACCOUNTS
